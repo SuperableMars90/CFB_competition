@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Credentials -- see INSTALL.md for what goes in each of these.
+# Listed by exact filename, not a directory wildcard, so that template/
+# example files placed alongside them (aiven.example.toml etc.) are NOT
+# accidentally ignored too.
+config/config.json
+secrets/aiven.toml
+secrets/local_mysql.toml
+secrets/cfbd_api_key
+secrets/wordpress.toml
+secrets/ca.pem
+.streamlit/secrets.toml
+
+# Generated/regenerable output -- not needed by a fresh install, and can
+# contain real season data (player names, scores) once the app's been run
+output/

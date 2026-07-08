@@ -1,0 +1,20 @@
+{
+    "database": {
+        "host":     "localhost",
+        "port":     3306,
+        "user":     "cfb_user",
+        "password": "your_password_here",
+        "database": "cfb_game"
+    },
+    "cfbd": {
+        "api_key": "your_cfbd_api_key_here"
+    },
+    "wordpress": {
+        "url":      "https://yoursite.wordpress.com",
+        "username": "your_wp_username",
+        "password": "your_wp_application_password"
+    },
+    "streamlit": {
+        "secret_key": "your_random_secret_here"
+    }
+}
