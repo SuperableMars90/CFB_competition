@@ -19,3 +19,10 @@ secrets/ca.pem
 # Generated/regenerable output -- not needed by a fresh install, and can
 # contain real season data (player names, scores) once the app's been run
 output/
+
+CLAUDE.md
+status/
+scratch/
+.claude/
+
+scratch/*
