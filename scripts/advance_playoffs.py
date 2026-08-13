@@ -26,7 +26,7 @@ from lib.bracket_engine import GameResult, playable_games, resolve_participant
 from lib.playoffs import (
     BRACKET_SPECS,
     PLAYOFF_ROUND_COUNT,
-    bracket_format_for_pod_count,
+    bracket_format_for_league_shape,
     compute_final_placements,
     resolve_playoff_game,
     find_exhibition_pairing,
@@ -439,17 +439,16 @@ def main():
         return
 
     pods = get_pods_for_season(season_id)
+    pod_of_player = get_pod_of_player(season_id)
     try:
-        bracket_format = bracket_format_for_pod_count(len(pods))
-    except ValueError:
-        print(f"ERROR: {len(pods)} pods found for season {args.season}; "
-              "playoffs only support 1 or 2 pods.")
+        bracket_format = bracket_format_for_league_shape(len(pods), len(pod_of_player))
+    except ValueError as e:
+        print(f"ERROR: {e} (season {args.season})")
         return
 
     final_week = cutoff_week + PLAYOFF_ROUND_COUNT[bracket_format]
 
     if args.week == final_week:
-        pod_of_player = get_pod_of_player(season_id)
         n = assign_exhibition_participants(
             season_id, ctx['id'], args.week, pod_of_player, cutoff_week, bracket_format,
         )

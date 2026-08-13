@@ -19,7 +19,9 @@ from lib.draft import (
     filter_and_sort_teams,
 )
 
-BASE_ORDER = [10, 20, 30, 40]  # 4 players, arbitrary player_ids
+BASE_ORDER = [10, 20, 30, 40]  # 4 players, arbitrary player_ids -- the 4-player-pod format
+
+BASE_ORDER_3 = [100, 200, 300]  # 3 players, arbitrary player_ids -- the 3-player-pod format
 
 
 class TestRoundOrder:
@@ -30,6 +32,13 @@ class TestRoundOrder:
     def test_even_round_reversed(self):
         assert round_order(BASE_ORDER, 2) == [40, 30, 20, 10]
         assert round_order(BASE_ORDER, 4) == [40, 30, 20, 10]
+
+    def test_3_players_odd_round_unchanged(self):
+        assert round_order(BASE_ORDER_3, 1) == [100, 200, 300]
+        assert round_order(BASE_ORDER_3, 3) == [100, 200, 300]
+
+    def test_3_players_even_round_reversed(self):
+        assert round_order(BASE_ORDER_3, 2) == [300, 200, 100]
 
 
 class TestSlotForPick:
@@ -53,6 +62,26 @@ class TestSlotForPick:
         assert slot.pick_in_round == 4
         assert slot.player_id == 10
 
+    def test_3_players_pick_1_is_round1_pick_in_round1(self):
+        slot = slot_for_pick(BASE_ORDER_3, 1)
+        assert slot == DraftSlot(pick_number=1, round_number=1, pick_in_round=1, player_id=100)
+
+    def test_3_players_pick_3_is_round1_pick_in_round3(self):
+        slot = slot_for_pick(BASE_ORDER_3, 3)
+        assert slot == DraftSlot(pick_number=3, round_number=1, pick_in_round=3, player_id=300)
+
+    def test_3_players_pick_4_is_round2_pick_in_round1_same_player_as_pick_3(self):
+        slot = slot_for_pick(BASE_ORDER_3, 4)
+        assert slot.round_number == 2
+        assert slot.pick_in_round == 1
+        assert slot.player_id == 300  # boundary carry-over from pick 3
+
+    def test_3_players_pick_6_is_round2_pick_in_round3(self):
+        slot = slot_for_pick(BASE_ORDER_3, 6)
+        assert slot.round_number == 2
+        assert slot.pick_in_round == 3
+        assert slot.player_id == 100
+
 
 class TestGenerateFullDraftOrder:
     def test_n4_picks_per_player_25(self):
@@ -65,6 +94,20 @@ class TestGenerateFullDraftOrder:
         # Matches slot_for_pick pick-for-pick.
         for pick_number in (1, 4, 5, 8, 100):
             assert slots[pick_number - 1] == slot_for_pick(BASE_ORDER, pick_number)
+
+    def test_n3_picks_per_player_30(self):
+        # The confirmed 3-player-pod format's real draft length
+        # (seasons.draft_picks_per_player=30) -- not just an arbitrary
+        # smaller number, the actual shape this transition produces.
+        slots = generate_full_draft_order(BASE_ORDER_3, 30)
+
+        assert len(slots) == 90
+        assert [s.pick_number for s in slots] == list(range(1, 91))
+        assert Counter(s.player_id for s in slots) == {100: 30, 200: 30, 300: 30}
+
+        # Matches slot_for_pick pick-for-pick.
+        for pick_number in (1, 3, 4, 6, 90):
+            assert slots[pick_number - 1] == slot_for_pick(BASE_ORDER_3, pick_number)
 
 
 class TestIsDoublePick:
@@ -81,6 +124,11 @@ class TestIsDoublePick:
     def test_last_pick_of_draft_has_no_second_no_crash(self):
         pick100 = slot_for_pick(BASE_ORDER, 100)
         assert is_double_pick(pick100, None) is False
+
+    def test_3_players_round_boundary_pair_is_double(self):
+        pick3 = slot_for_pick(BASE_ORDER_3, 3)
+        pick4 = slot_for_pick(BASE_ORDER_3, 4)
+        assert is_double_pick(pick3, pick4) is True
 
 
 class TestOrdinal:

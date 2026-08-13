@@ -46,6 +46,7 @@ def require_login() -> dict:
     password = st.text_input("Password", type="password", autocomplete="current-password")
 
     if st.button("Log in"):
+        username = username.lower()
         expected = st.secrets.get("auth", {}).get(username)
         if expected is not None and expected == password:
             record = get_player_by_username(username, CURRENT_SEASON_ID)

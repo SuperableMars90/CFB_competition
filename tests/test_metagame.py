@@ -153,3 +153,65 @@ def test_pod_standings_requires_exactly_two_pods():
     with pytest.raises(ValueError):
         compute_pod_standings(week=1, season_id=8, ctx=CTX,
                                player_totals=player_totals, pod_of_player=pod_of_player)
+
+
+# ------------------------------------------------------------------
+# compute_pod_standings -- 3-player-pod (6 total players) fixtures.
+# Same formula/code path as the 8-player tests above (no code change
+# expected -- points_map is just a shorter list); confirmed points_map
+# for this format (Zach, 2026-08-09): rank r gets (6-r) points, same
+# "1 point per spot" logic as season 8's [7,6,5,4,3,2,1,0], just for 6
+# total players instead of 8. Max weekly total drops to 8 (5 base + 3
+# bonuses), not 10 -- season 8's max=10 was an artifact of 8 players,
+# not an invariant this format needs to preserve.
+# ------------------------------------------------------------------
+
+CTX_SIX = {'id': 16, 'points_map': [5, 4, 3, 2, 1, 0]}
+
+
+def test_pod_standings_six_player_base_points_by_overall_rank():
+    # a1..a3 in POD_A, b1..b3 in POD_B; overall order: a1,b1,a2,b2,a3,b3
+    player_totals = _totals(a1=50, a2=30, a3=10, b1=45, b2=25, b3=5)
+    pod_of_player = {'a1': POD_A, 'a2': POD_A, 'a3': POD_A,
+                      'b1': POD_B, 'b2': POD_B, 'b3': POD_B}
+
+    results = compute_pod_standings(week=1, season_id=44, ctx=CTX_SIX,
+                                     player_totals=player_totals, pod_of_player=pod_of_player)
+    by_id = {r['player_id']: r for r in results}
+
+    assert by_id['a1']['overall_rank'] == 1 and by_id['a1']['base_points'] == 5
+    assert by_id['b1']['overall_rank'] == 2 and by_id['b1']['base_points'] == 4
+    assert by_id['a2']['overall_rank'] == 3 and by_id['a2']['base_points'] == 3
+    assert by_id['b3']['overall_rank'] == 6 and by_id['b3']['base_points'] == 0
+
+
+def test_pod_standings_six_player_bonuses_stack_to_max_eight_for_overall_winner():
+    # a1 wins overall, wins their (3-player) pod, and pod A's combined
+    # total is higher -- max weekly total for this format is 8, not 10.
+    player_totals = _totals(a1=50, a2=30, a3=10, b1=45, b2=25, b3=5)
+    pod_of_player = {'a1': POD_A, 'a2': POD_A, 'a3': POD_A,
+                      'b1': POD_B, 'b2': POD_B, 'b3': POD_B}
+
+    results = compute_pod_standings(week=1, season_id=44, ctx=CTX_SIX,
+                                     player_totals=player_totals, pod_of_player=pod_of_player)
+    by_id = {r['player_id']: r for r in results}
+
+    # pod A total = 90, pod B total = 75 -> A wins pod-vs-pod
+    a1 = by_id['a1']
+    assert a1['base_points'] == 5
+    assert a1['pod_bonus'] == 1        # top of pod A
+    assert a1['pod_vs_pod_bonus'] == 1  # pod A's combined total is higher
+    assert a1['overall_bonus'] == 1    # overall #1
+    assert a1['match_play_points'] == 8
+
+    # b1: 2nd overall, wins pod B, but pod B lost pod-vs-pod and isn't overall #1
+    b1 = by_id['b1']
+    assert b1['base_points'] == 4
+    assert b1['pod_bonus'] == 1
+    assert b1['pod_vs_pod_bonus'] == 0
+    assert b1['overall_bonus'] == 0
+    assert b1['match_play_points'] == 5
+
+    # b3: last place, no bonuses at all
+    b3 = by_id['b3']
+    assert b3['match_play_points'] == 0

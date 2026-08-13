@@ -140,6 +140,43 @@ class TestBuildPvpSchedule:
         assert all(c == 3 for c in counts.values())
         assert len(counts) == 6
 
+    def test_single_pod_with_pod_of_player_labels_matchup_type(self):
+        # The 3-player-pod PVP design: 2 pods of 3 (6 players total),
+        # flat double round robin, matchup_type derived from pod
+        # membership rather than the tiered two-pod path.
+        pod_of_player = {1: 'A', 2: 'A', 3: 'A', 11: 'B', 12: 'B', 13: 'B'}
+        schedule = build_pvp_schedule(
+            single_pod_players=[1, 2, 3, 11, 12, 13],
+            pod_of_player=pod_of_player,
+            regular_season_weeks=10,
+            single_pod_repeats=2,
+        )
+
+        non_bye_weeks = [wk for wk, games in schedule.items() if games]
+        all_games = [g for wk in non_bye_weeks for g in schedule[wk]]
+
+        # Every pair meets exactly twice (double round robin over all 6).
+        pairs = Counter(frozenset((a, b)) for a, b, _ in all_games)
+        assert all(c == 2 for c in pairs.values())
+        assert len(pairs) == 15  # C(6,2)
+
+        # matchup_type matches pod membership, not a hardcoded label.
+        for a, b, matchup_type in all_games:
+            same_pod = pod_of_player[a] == pod_of_player[b]
+            assert matchup_type == ('in_pod' if same_pod else 'cross_pod')
+
+        in_pod_games = [g for g in all_games if g[2] == 'in_pod']
+        cross_games = [g for g in all_games if g[2] == 'cross_pod']
+        assert len(in_pod_games) == 12   # 2 pods x C(3,2)=3 pairs x 2 meetings
+        assert len(cross_games) == 18    # 3x3=9 cross pairs x 2 meetings
+
+    def test_single_pod_without_pod_of_player_still_labels_in_pod(self):
+        # Backward-compat: omitting pod_of_player keeps the original
+        # single-pod behavior (every pair 'in_pod') unchanged.
+        schedule = build_pvp_schedule(single_pod_players=[1, 2, 3, 4])
+        non_bye_weeks = [wk for wk, games in schedule.items() if games]
+        assert all(g[2] == 'in_pod' for wk in non_bye_weeks for g in schedule[wk])
+
     def test_two_pod_four_and_four(self):
         schedule = build_pvp_schedule(pod_a=[1, 2, 3, 4], pod_b=[11, 12, 13, 14])
 

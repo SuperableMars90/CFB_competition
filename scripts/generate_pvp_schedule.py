@@ -6,18 +6,35 @@ reserving enough weeks at the end for the playoffs, and writes it into
 matchup_pairings; then writes TBD placeholder rows for every playoff
 bracket game and exhibition game into playoff_games (participants left
 NULL until scripts/seed_playoffs.py and scripts/advance_playoffs.py
-resolve them). Auto-detects single-pod vs. two-pod from how many pods
-exist for the season -- 3+ pods are not supported (hard error).
+resolve them). Auto-detects the bracket format from the season's actual
+pod count and total player count -- any (pod count, player count)
+combination with no confirmed bracket design is a hard error, not a
+guess (see lib.playoffs.bracket_format_for_league_shape).
 
-Single pod (four_team playoffs): everyone plays everyone
---single-pod-repeats times (3). Two pods (eight_team playoffs, equal
-size): everyone plays their podmates --two-pod-in-pod-repeats times
-(2), and every opposite-pod player once. See lib/scheduling.py for the
-round-robin generator and lib/playoffs.py for the bracket specs.
+Scheduling shape depends on bracket_format, not just pod count -- see
+lib/scheduling.py's module docstring for why these are two genuinely
+different shapes rather than one generalized formula:
+  - four_team (1 pod): everyone plays everyone --single-pod-repeats
+    times (3).
+  - eight_team (2 pods of 4, the original shape): everyone plays their
+    podmates --two-pod-in-pod-repeats times (2), and every opposite-pod
+    player once.
+  - six_team (2 pods of 3): flat -- everyone plays everyone
+    --six-team-repeats times (2), regardless of pod; matchup_type is
+    still recorded per pair (in_pod/cross_pod) for PVP-record tracking,
+    just not used to shape the schedule itself.
+See lib/scheduling.py for the round-robin generator and lib/playoffs.py
+for the bracket specs.
+
+Bracket format is resolved from (pod count, total player count) via
+lib.playoffs.bracket_format_for_league_shape -- e.g. 2 pods of 4 (8
+players) -> eight_team, 2 pods of 3 (6 players) -> six_team; a
+combination with no confirmed bracket design raises an error rather than
+guessing.
 
 The regular-season week count is auto-computed as
 seasons.last_week - playoff_round_count (2 for four_team, 3 for
-eight_team) unless --weeks overrides it -- this is what actually
+six_team/eight_team) unless --weeks overrides it -- this is what actually
 reserves the right number of weeks for the playoffs given the real
 season's length, which varies year to year.
 
@@ -46,7 +63,7 @@ from lib.playoffs import (
     BRACKET_SPECS,
     PLAYOFF_ROUND_COUNT,
     EXHIBITION_GAME_COUNT,
-    bracket_format_for_pod_count,
+    bracket_format_for_league_shape,
 )
 
 
@@ -82,6 +99,20 @@ def get_pod_players(conn, pod_id):
     rows = cursor.fetchall()
     cursor.close()
     return rows
+
+
+def get_pod_of_player(conn, season_id):
+    """{player_id: pod_id} for every player with a pod assignment this
+    season. Pod membership is per-season (pod_memberships), not a
+    permanent players.pod_id."""
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT player_id, pod_id FROM pod_memberships WHERE season_id = %s",
+        (season_id,),
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+    return {player_id: pod_id for player_id, pod_id in rows}
 
 
 def get_player_names(conn, player_ids):
@@ -340,7 +371,10 @@ def main():
     parser.add_argument('--single-pod-repeats', type=int, default=3,
                         help='Times each pair plays in single-pod mode (default 3)')
     parser.add_argument('--two-pod-in-pod-repeats', type=int, default=2,
-                        help='Times each in-pod pair plays in two-pod mode (default 2)')
+                        help='Times each in-pod pair plays in two-pod (eight_team) mode (default 2)')
+    parser.add_argument('--six-team-repeats', type=int, default=2,
+                        help='Times each pair plays in six_team mode (2 pods of 3, flat '
+                             'schedule regardless of pod) (default 2)')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
 
@@ -376,11 +410,11 @@ def main():
               "but required before a live write.")
 
     pods = get_pods(conn, season_id)
+    n_players = sum(len(get_pod_players(conn, pod['id'])) for pod in pods)
     try:
-        bracket_format = bracket_format_for_pod_count(len(pods))
-    except ValueError:
-        print(f"ERROR: {len(pods)} pods found for season {args.season}; "
-              "this generator only supports 1 or 2 pods.")
+        bracket_format = bracket_format_for_league_shape(len(pods), n_players)
+    except ValueError as e:
+        print(f"ERROR: {e} (season {args.season})")
         conn.close()
         sys.exit(1)
 
@@ -399,7 +433,7 @@ def main():
         print(f"Regular-season weeks auto-computed: season_weeks={season_weeks} - "
               f"playoff_rounds={playoff_rounds} = {regular_season_weeks}")
 
-    if len(pods) == 1:
+    if bracket_format == 'four_team':
         players = get_pod_players(conn, pods[0]['id'])
         player_ids = [p['id'] for p in players]
         names = {p['id']: p['name'] for p in players}
@@ -409,6 +443,20 @@ def main():
             single_pod_repeats=args.single_pod_repeats,
         )
         scenario = f"single pod ({len(player_ids)} players, {args.single_pod_repeats}x round robin)"
+    elif bracket_format == 'six_team':
+        all_players = [p for pod in pods for p in get_pod_players(conn, pod['id'])]
+        player_ids = [p['id'] for p in all_players]
+        names = {p['id']: p['name'] for p in all_players}
+        schedule = build_pvp_schedule(
+            single_pod_players=player_ids,
+            pod_of_player=get_pod_of_player(conn, season_id),
+            regular_season_weeks=regular_season_weeks,
+            single_pod_repeats=args.six_team_repeats,
+        )
+        scenario = (
+            f"flat schedule across 2 pods ({len(player_ids)} players total, "
+            f"{args.six_team_repeats}x round robin, regardless of pod)"
+        )
     else:
         pod_a_players = get_pod_players(conn, pods[0]['id'])
         pod_b_players = get_pod_players(conn, pods[1]['id'])

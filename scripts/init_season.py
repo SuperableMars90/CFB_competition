@@ -24,6 +24,9 @@ Usage:
 
     # With canonical name overrides
     PYTHONPATH=. python scripts/init_season.py --year 2025 --overrides config/name_overrides_2025.json
+
+    # 3-player-pod season (30 picks/player instead of the 25 default)
+    PYTHONPATH=. python scripts/init_season.py --year 2026 --draft-picks-per-player 30
 """
 
 import argparse
@@ -50,7 +53,7 @@ CONFERENCE_TIERS = {
     'ACC':          'P4',
     # G6
     'Sun Belt':     'G6',
-    'MAC':          'G6',
+    'Mid-American': 'G6',
     'Conference USA': 'G6',
     'Mountain West': 'G6',
     'American Athletic': 'G6',
@@ -106,13 +109,34 @@ def build_canonical_names(team, overrides):
 # Stage 1: Conferences
 # ------------------------------------------------------------------
 
-def build_conference_rows(cfbd_conferences, season_id):
+def used_conference_names(cfbd_teams):
+    """
+    Conference names actually referenced by a real team this season (after
+    INDEPENDENT_ASSIGNMENTS substitution). CFBD's /conferences endpoint is
+    not year-scoped and returns every conference on file, including ~60
+    long-defunct ones with no teams and no `abbreviation` -- filtering
+    conference rows down to this set is what keeps those out, rather than
+    guessing at a name-length cutoff.
+    """
+    names = set()
+    for team in cfbd_teams:
+        classification = str(team.get('classification', '')).lower()
+        if classification not in VALID_CLASSIFICATIONS:
+            continue
+        names.add(INDEPENDENT_ASSIGNMENTS.get(team.get('id')) or team.get('conference', ''))
+    return names
+
+
+def build_conference_rows(cfbd_conferences, season_id, used_names=None):
     rows = []
     skipped = []
 
     for c in cfbd_conferences:
         classification = c.get('classification', '').lower()
         if classification not in VALID_CLASSIFICATIONS:
+            skipped.append(c.get('name'))
+            continue
+        if used_names is not None and c.get('name') not in used_names:
             skipped.append(c.get('name'))
             continue
 
@@ -122,7 +146,9 @@ def build_conference_rows(cfbd_conferences, season_id):
         rows.append({
             'season_id':    season_id,
             'name':         c.get('name', ''),
-            'abbreviation': c.get('abbreviation') or c.get('name', ''),
+            # CFBD sometimes omits abbreviation entirely; truncate the name
+            # fallback to fit the column rather than risk a DataError.
+            'abbreviation': (c.get('abbreviation') or c.get('name', ''))[:20],
             'tier':         tier,   # NULL for FCS and unrecognized FBS conferences
             'cfbd_id':      str(c.get('id', '')),
             'level':        level,
@@ -262,15 +288,15 @@ def build_game_rows(cfbd_games, team_id_map, season_id, week0_cfbd_ids):
 # Database writes
 # ------------------------------------------------------------------
 
-def write_season(conn, year, week0_cutoff_week):
+def write_season(conn, year, week0_cutoff_week, draft_picks_per_player):
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO seasons (year, first_week, last_week, week0_cutoff_week)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO seasons (year, first_week, last_week, week0_cutoff_week, draft_picks_per_player)
+        VALUES (%s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)
         """,
-        (year, 1, 15, week0_cutoff_week)
+        (year, 1, 15, week0_cutoff_week, draft_picks_per_player)
     )
     conn.commit()
     season_id = cursor.lastrowid
@@ -426,6 +452,9 @@ def main():
     parser.add_argument('--week0-file',   type=str, default='', help='Path to file with one game ID per line')
     parser.add_argument('--overrides',    type=str, default='')
     parser.add_argument('--week0-cutoff', type=int, default=4)
+    parser.add_argument('--draft-picks-per-player', type=int, default=25,
+                        help='Draft length / active roster size per player -- 25 for 4-player '
+                             'pods, 30 for 3-player pods (default 25)')
     args = parser.parse_args()
 
     week0_ids = set()
@@ -465,7 +494,8 @@ def main():
         sys.exit(1)
 
     season_id = 0  # placeholder for dry run
-    conf_rows, skipped_confs = build_conference_rows(cfbd_conferences, season_id)
+    used_names = used_conference_names(cfbd_teams)
+    conf_rows, skipped_confs = build_conference_rows(cfbd_conferences, season_id, used_names)
     team_rows, skipped_teams = build_team_rows(cfbd_teams, conf_rows, overrides, season_id)
     fake_team_map = {r['cfbd_id']: i + 1 for i, r in enumerate(team_rows)}
     game_rows, skipped_games = build_game_rows(cfbd_games, fake_team_map, season_id, week0_ids)
@@ -479,10 +509,10 @@ def main():
     print(f"\nWriting {args.year} season to database...")
     conn = get_connection()
 
-    season_id = write_season(conn, args.year, args.week0_cutoff)
-    print(f"  Season record: id={season_id}")
+    season_id = write_season(conn, args.year, args.week0_cutoff, args.draft_picks_per_player)
+    print(f"  Season record: id={season_id} (draft_picks_per_player={args.draft_picks_per_player})")
 
-    conf_rows, _ = build_conference_rows(cfbd_conferences, season_id)
+    conf_rows, _ = build_conference_rows(cfbd_conferences, season_id, used_names)
     conf_id_map  = write_conferences(conn, conf_rows, season_id)
     print(f"  Conferences written: {len(conf_id_map)}")
 

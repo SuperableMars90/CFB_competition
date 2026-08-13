@@ -17,8 +17,11 @@ as a work-in-progress, not a polished product.
 
 ## The actual game
 
-Each player drafts 25 real FBS teams before the season starts. Every
-week, you set a 16-slot lineup:
+Each player drafts a season-configured number of real FBS teams before
+the season starts — 25 in the original 4-player-pod format, 30 in a
+3-player-pod one; pod size and count are set once at season creation,
+not hardcoded. Every week, you set a 16-slot lineup, and that part never
+changes regardless of pod format:
 
 - one team for each of 10 conferences (4 Power-4, 6 Group-of-6)
 - 3 extra "flex" slots for any P4 team
@@ -34,8 +37,8 @@ bonuses, and a shared overall leaderboard all layer in on top of the
 per-pod scoring.
 
 Past the regular season, a round-robin PVP schedule feeds into seeding
-for a bracket playoff (4-team or 8-team, depending on pod count), with
-weekly advancement through to a champion.
+for a bracket playoff (4-, 6-, or 8-team, depending on pod count and
+size), with weekly advancement through to a champion.
 
 Every week, you also get a recap: your score against the best lineup
 you *could* have started from your own roster, against a free-agent-only

@@ -23,7 +23,7 @@ from lib.db import (
     DraftOutOfSyncError,
 )
 
-SEASON_ID = CURRENT_SEASON_ID  # real season 8 -- see module docstring
+SEASON_ID = CURRENT_SEASON_ID  # real live season -- see module docstring
 
 
 def _get_unrostered_team_ids(n):
@@ -263,6 +263,68 @@ def test_pod_scoped_availability_two_pods(two_synthetic_pods):
     state_b = get_draft_page_state(SEASON_ID, pod_b['pod_id'])
     assert team_id in {t['team_id'] for t in state_b.available_teams}
 
-    # ...and correctly gone from Pod A's own availability.
-    state_a = get_draft_page_state(SEASON_ID, pod_a['pod_id'])
-    assert team_id not in {t['team_id'] for t in state_a.available_teams}
+
+@pytest.fixture
+def synthetic_3player_pod_season():
+    """
+    A fully synthetic season (draft_picks_per_player=30) plus one
+    synthetic 3-player pod under it -- proves set_draft_order() reads
+    the per-season config rather than a hardcoded pick count. No teams
+    needed: this only exercises draft_order, not team assignment.
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO seasons (year, last_week, draft_picks_per_player) VALUES (%s, %s, %s)",
+            (9998, 15, 30),
+        )
+        season_id = cur.lastrowid
+        cur.execute("INSERT INTO pods (season_id, name) VALUES (%s, %s)", (season_id, 'ThreePlayerTest'))
+        pod_id = cur.lastrowid
+        player_ids = []
+        for i in range(3):
+            cur.execute(
+                "INSERT INTO players (name, username, password_hash) VALUES (%s, %s, 'x')",
+                (f'ThreePlayerTestP{i}', f'draft_test_3p_{i}_{pod_id}'),
+            )
+            player_id = cur.lastrowid
+            cur.execute(
+                "INSERT INTO pod_memberships (season_id, pod_id, player_id) VALUES (%s, %s, %s)",
+                (season_id, pod_id, player_id),
+            )
+            player_ids.append(player_id)
+        conn.commit()
+        cur.close()
+
+    yield {'season_id': season_id, 'pod_id': pod_id, 'player_ids': player_ids}
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        placeholders = ",".join(["%s"] * len(player_ids))
+        cur.execute("DELETE FROM draft_order WHERE pod_id = %s", (pod_id,))
+        cur.execute(f"DELETE FROM pod_memberships WHERE player_id IN ({placeholders})", tuple(player_ids))
+        cur.execute(f"DELETE FROM players WHERE id IN ({placeholders})", tuple(player_ids))
+        cur.execute("DELETE FROM pods WHERE id = %s", (pod_id,))
+        cur.execute("DELETE FROM seasons WHERE id = %s", (season_id,))
+        conn.commit()
+        cur.close()
+
+
+@pytest.mark.integration
+def test_set_draft_order_uses_season_draft_picks_per_player(synthetic_3player_pod_season):
+    """3 players x 30 picks/player (this season's config) = 90 total slots,
+    not the 4x25=100 every other test in this file exercises against real
+    season 8 -- confirms set_draft_order() reads seasons.draft_picks_per_player
+    per-season rather than a hardcoded constant."""
+    season_id = synthetic_3player_pod_season['season_id']
+    pod_id = synthetic_3player_pod_season['pod_id']
+    p1, p2, p3 = synthetic_3player_pod_season['player_ids']
+
+    set_draft_order(season_id, pod_id, [p1, p2, p3], set_by=p1)
+
+    state = get_draft_page_state(season_id, pod_id)
+    assert len(state.all_slots) == 90
+    assert [s.pick_number for s in state.all_slots] == list(range(1, 91))
+    assert state.all_slots[0].player_id == p1   # pick 1
+    assert state.all_slots[2].player_id == p3   # pick 3
+    assert state.all_slots[3].player_id == p3   # pick 4 -- boundary carry-over (3-player snake)

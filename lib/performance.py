@@ -5,9 +5,10 @@ Retroactive performance benchmarks for an already-completed week, built
 on lib.optimal_lineup's optimizer. Three named comparisons (Zach,
 2026-07-06), a dependency of the post-week summary/recap page:
 
-  - compute_player_optimal() — a real player's own 25-team roster: how
-    close did their actual submitted lineup get to the best they could
-    have done with the teams they own?
+  - compute_player_optimal() — a real player's own full roster (size is
+    season config, see lib.db.get_draft_picks_per_player): how close did
+    their actual submitted lineup get to the best they could have done
+    with the teams they own?
   - compute_scrappy_optimal() — "Scrappy": a synthetic player limited to
     a pod's free-agent pool only (the scraps nobody drafted).
   - compute_max_optimal() — "Max": a synthetic player with access to

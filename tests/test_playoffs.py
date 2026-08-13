@@ -11,14 +11,16 @@ from lib.bracket_engine import GameResult
 from lib.seeding import MatchupRecord
 from lib.playoffs import (
     FOUR_TEAM_BRACKET,
+    SIX_TEAM_BRACKET,
     EIGHT_TEAM_BRACKET,
     assign_seeds_4_team,
+    assign_seeds_6_team,
     assign_seeds_8_team,
     compute_4_team_placements,
     pick_record_score,
     resolve_playoff_game,
     find_exhibition_pairing,
-    bracket_format_for_pod_count,
+    bracket_format_for_league_shape,
     compute_final_placements,
     UnresolvedPlayoffTieError,
 )
@@ -105,6 +107,39 @@ class TestAssignSeeds8Team:
         pod_of_player = {100 + i: 'A' for i in range(1, 9)}
         with pytest.raises(ValueError):
             assign_seeds_8_team(seeding, pod_of_player)
+
+
+class TestAssignSeeds6Team:
+    def test_alternating_pods_matches_overall_order(self):
+        seeding = [seeding_row(i, i) for i in range(1, 7)]
+        pod_of_player = {1: 'A', 3: 'A', 5: 'A', 2: 'B', 4: 'B', 6: 'B'}
+        result = assign_seeds_6_team(seeding, pod_of_player)
+        assert result == {1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6}
+
+    def test_overall_number_2_bumped_to_seed_3_when_same_pod_as_1(self):
+        # Same shape as the 8-team scenario, scaled to 3-player pods:
+        # P1/P2 share a pod; P3 (other pod) jumps to seed 2.
+        seeding = [seeding_row(i, i) for i in range(1, 7)]
+        pod_of_player = {1: 'A', 2: 'A', 4: 'A', 3: 'B', 5: 'B', 6: 'B'}
+        result = assign_seeds_6_team(seeding, pod_of_player)
+        assert result[1] == 1
+        assert result[2] == 3  # other pod's best, not overall #2
+        assert result[3] == 2  # overall #2, bumped down for sharing seed 1's pod
+        assert result[4] == 4
+        assert result[5] == 5
+        assert result[6] == 6
+
+    def test_wrong_length_raises(self):
+        seeding = [seeding_row(i, 100 + i) for i in range(1, 6)]
+        pod_of_player = {100 + i: 'A' if i % 2 else 'B' for i in range(1, 6)}
+        with pytest.raises(ValueError):
+            assign_seeds_6_team(seeding, pod_of_player)
+
+    def test_all_one_pod_raises(self):
+        seeding = [seeding_row(i, 100 + i) for i in range(1, 7)]
+        pod_of_player = {100 + i: 'A' for i in range(1, 7)}
+        with pytest.raises(ValueError):
+            assign_seeds_6_team(seeding, pod_of_player)
 
 
 class TestCompute4TeamPlacements:
@@ -274,20 +309,25 @@ class TestFindExhibitionPairing:
         assert len(results) == 1
 
 
-class TestBracketFormatForPodCount:
-    def test_one_pod_is_four_team(self):
-        assert bracket_format_for_pod_count(1) == 'four_team'
+class TestBracketFormatForLeagueShape:
+    def test_one_pod_four_players_is_four_team(self):
+        assert bracket_format_for_league_shape(1, 4) == 'four_team'
 
-    def test_two_pods_is_eight_team(self):
-        assert bracket_format_for_pod_count(2) == 'eight_team'
+    def test_two_pods_six_players_is_six_team(self):
+        assert bracket_format_for_league_shape(2, 6) == 'six_team'
 
-    def test_zero_pods_raises(self):
+    def test_two_pods_eight_players_is_eight_team(self):
+        assert bracket_format_for_league_shape(2, 8) == 'eight_team'
+
+    def test_unconfirmed_combination_raises(self):
         with pytest.raises(ValueError):
-            bracket_format_for_pod_count(0)
-
-    def test_three_pods_raises(self):
+            bracket_format_for_league_shape(0, 0)
         with pytest.raises(ValueError):
-            bracket_format_for_pod_count(3)
+            bracket_format_for_league_shape(3, 9)
+        with pytest.raises(ValueError):
+            bracket_format_for_league_shape(1, 6)  # right player count, wrong pod count
+        with pytest.raises(ValueError):
+            bracket_format_for_league_shape(2, 4)  # right pod count, wrong player count
 
 
 class TestComputeFinalPlacements:
@@ -304,6 +344,30 @@ class TestComputeFinalPlacements:
         }
         assert compute_final_placements('four_team', seed_to_player, full) == {
             1: 11, 2: 12, 3: 13, 4: 14,
+        }
+
+    def test_six_team_none_until_g6_and_g7_decided_even_though_5_and_6_known_early(self):
+        seed_to_player = {i: i for i in range(1, 7)}
+        early = {
+            1: GameResult(3, 6),  # G1: seed3 beats seed6
+            2: GameResult(4, 5),  # G2: seed4 beats seed5
+            3: GameResult(5, 6),  # G3: loser(G2) beats loser(G1) -- 5th/6th decided
+        }
+        # Place 5/6 (from G3) already known, but the bracket as a whole
+        # isn't finished -- must still return None.
+        assert compute_final_placements('six_team', seed_to_player, early) is None
+
+        full = {
+            1: GameResult(3, 6),
+            2: GameResult(4, 5),
+            3: GameResult(5, 6),
+            4: GameResult(1, 4),  # G4: seed1 beats winner(G2)
+            5: GameResult(2, 3),  # G5: seed2 beats winner(G1)
+            6: GameResult(3, 4),  # G6: loser(G4) beats loser(G5) -- 3rd/4th
+            7: GameResult(1, 2),  # G7: winner(G4) beats winner(G5) -- championship
+        }
+        assert compute_final_placements('six_team', seed_to_player, full) == {
+            1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6,
         }
 
     def test_eight_team_none_until_g7_and_g8_decided_even_though_5_through_8_known_early(self):

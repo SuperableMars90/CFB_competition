@@ -747,6 +747,25 @@ def get_week0_cutoff_week(season_id: int) -> Optional[int]:
 
 
 @st.cache_data(ttl=3600)
+def get_draft_picks_per_player(season_id: int) -> int:
+    """
+    Draft length / active roster size for this season (e.g. 25 for
+    4-player pods, 30 for 3-player pods) -- season-init-time config
+    (seasons.draft_picks_per_player), not a hardcoded constant, so pod
+    size can vary season to season without a code change. Raises
+    ValueError for an unknown season_id rather than silently defaulting.
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT draft_picks_per_player FROM seasons WHERE id = %s", (season_id,))
+        row = cur.fetchone()
+        cur.close()
+    if row is None:
+        raise ValueError(f"no season found for season_id={season_id}")
+    return row[0]
+
+
+@st.cache_data(ttl=3600)
 def get_week_date_ranges(season_id: int) -> dict[int, dict]:
     """
     Return {week: {'start_date': date, 'end_date': date}} for every week
@@ -1189,8 +1208,9 @@ def set_draft_order(season_id: int, pod_id: int, base_order: list, set_by: int) 
     exactly what this feature needed) -- accepted here for call-site
     clarity about who's performing the setup, even though it isn't stored.
     """
-    from lib.config import DRAFT_PICKS_PER_PLAYER
     from lib.draft import generate_full_draft_order
+
+    picks_per_player = get_draft_picks_per_player(season_id)
 
     with get_connection() as conn:
         cur = conn.cursor()
@@ -1210,7 +1230,7 @@ def set_draft_order(season_id: int, pod_id: int, base_order: list, set_by: int) 
                 (season_id, pod_id),
             )
 
-            slots = generate_full_draft_order(base_order, DRAFT_PICKS_PER_PLAYER)
+            slots = generate_full_draft_order(base_order, picks_per_player)
             for slot in slots:
                 cur.execute(
                     """

@@ -2,9 +2,9 @@
 scripts/seed_playoffs.py
 -------------------------
 Run once, the week the PVP regular season concludes. Computes final
-seeding, assigns bracket seeds (pod-aware for eight_team), writes them
-into season_standings, and resolves every seed-sourced playoff_games
-placeholder to a real player_id.
+seeding, assigns bracket seeds (pod-aware for six_team/eight_team),
+writes them into season_standings, and resolves every seed-sourced
+playoff_games placeholder to a real player_id.
 
 Refuses to run if the regular season isn't actually complete yet, same
 scope guard as scripts/break_tie.py -- this is for final seeding only.
@@ -28,8 +28,9 @@ from lib.seeding import (
 )
 from lib.playoffs import (
     assign_seeds_4_team,
+    assign_seeds_6_team,
     assign_seeds_8_team,
-    bracket_format_for_pod_count,
+    bracket_format_for_league_shape,
 )
 
 
@@ -255,14 +256,15 @@ def main():
 
     pods = get_pods_for_season(season_id)
     try:
-        bracket_format = bracket_format_for_pod_count(len(pods))
-    except ValueError:
-        print(f"ERROR: {len(pods)} pods found for season {args.season}; "
-              "playoffs only support 1 or 2 pods.")
+        bracket_format = bracket_format_for_league_shape(len(pods), len(seeding))
+    except ValueError as e:
+        print(f"ERROR: {e} (season {args.season})")
         return
 
     if bracket_format == 'four_team':
         seed_to_player = assign_seeds_4_team(seeding)
+    elif bracket_format == 'six_team':
+        seed_to_player = assign_seeds_6_team(seeding, get_pod_of_player(season_id))
     else:
         seed_to_player = assign_seeds_8_team(seeding, get_pod_of_player(season_id))
 

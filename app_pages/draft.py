@@ -112,9 +112,10 @@ elif open_slots[0].player_id != player_id:
     slot = open_slots[0]
     on_clock_name = player_names.get(slot.player_id, f"Player {slot.player_id}")
     st.info(
-        f"Round {slot.round_number}, pick {slot.pick_number}: **{on_clock_name}** is on the clock. "
-        "Refresh this page once it's your turn to see the current available teams."
+        f"Round {slot.round_number}, pick {slot.pick_number}: **{on_clock_name}** is on the clock."
     )
+    st.button("Check whose turn it is")
+    st.caption("Use this button, not your browser's refresh — a browser refresh logs you out.")
 else:
     pending = st.session_state.get("draft_pending_picks")
 

@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS seasons (
     pvp_regular_season_end_week INT COMMENT 'Last week of the PVP regular-season round-robin, weeks after this are playoffs/other content. NULL = not configured.',
     draft_date      DATE,
     default_lock_time TIME NOT NULL DEFAULT '12:00:00' COMMENT 'Weekly lineup lock time (local)',
+    draft_picks_per_player INT NOT NULL DEFAULT 25
+                    COMMENT 'Draft length / active roster size for this season -- read by lib.db.set_draft_order() instead of a hardcoded constant, so pod size (e.g. 25 for 4-player pods, 30 for 3-player pods) is season-init-time config, not a code change. Default 25 preserves existing seasons unchanged.',
     notes           TEXT,
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -300,12 +302,12 @@ CREATE TABLE IF NOT EXISTS playoff_games (
     id                      INT AUTO_INCREMENT PRIMARY KEY,
     season_id               INT NOT NULL,
     scoring_context_id      INT NOT NULL,
-    bracket_format          ENUM('four_team', 'eight_team') NOT NULL
+    bracket_format          ENUM('four_team', 'six_team', 'eight_team') NOT NULL
         COMMENT 'Which lib.playoffs bracket spec this row belongs to',
     game_type               ENUM('bracket', 'exhibition') NOT NULL DEFAULT 'bracket'
         COMMENT 'bracket = real GameSpec game, feeds placements, exhibition = fills an idle eliminated players final week, never affects placement',
     game_number             INT NOT NULL
-        COMMENT 'Matches GameSpec.game_number for bracket rows (1-2 four_team, 1-8 eight_team), exhibition rows continue the sequence (3 for four_team, 9-10 for eight_team)',
+        COMMENT 'Matches GameSpec.game_number for bracket rows (1-2 four_team, 1-7 six_team, 1-8 eight_team), exhibition rows continue the sequence (3 for four_team, 8 for six_team, 9-10 for eight_team)',
     round                   INT NOT NULL
         COMMENT 'GameSpec.round label, exhibition rows use the brackets final round number',
     week                    INT NOT NULL COMMENT 'Real calendar week = regular_season_weeks + round',

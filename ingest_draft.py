@@ -5,8 +5,10 @@ Reads a draft spreadsheet (CSV or XLSX) and populates the
 draft_order and rosters tables for a given season and pod.
 
 Expected spreadsheet columns (case-insensitive):
-    Overall   -- overall pick number (1-100)
-    Round     -- round number (1-25)
+    Overall   -- overall pick number (e.g. 1-100 for a 4-player/25-pick pod;
+                 range depends on the pod's size and this season's
+                 draft_picks_per_player, not fixed)
+    Round     -- round number (e.g. 1-25 for the same example above)
     Picker    -- player name as it appears in the players table
     Team      -- team name matched against teams.name_short
 

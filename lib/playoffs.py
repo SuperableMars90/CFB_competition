@@ -2,10 +2,19 @@
 lib/playoffs.py
 ----------------
 Playoff formats built on top of lib.bracket_engine: the declarative
-4-team and 8-team bracket specs (transcribed from
-8_team_playoff_matchup_table.tsv / 8_team_playoff_placement_table.tsv),
-seed assignment from regular-season standings, and the playoff-game
-tiebreak rule.
+4-team, 6-team, and 8-team bracket specs (4-team/8-team transcribed from
+8_team_playoff_matchup_table.tsv / 8_team_playoff_placement_table.tsv;
+6-team from playoff_games.csv / placement.csv, added 2026-08 for the
+2-pods-of-3 format -- see transition_plan.md), seed assignment from
+regular-season standings, and the playoff-game tiebreak rule.
+
+Format selection (bracket_format_for_league_shape) is keyed on
+(pod count, total player count), not hardcoded to one pod arrangement --
+a season can go back to 2 pods of 4 (eight_team) after a season of 2
+pods of 3 (six_team) with no code change, only a different season-init
+config. Adding support for a genuinely new pod/player-count combination
+still requires a new confirmed bracket design (see the CSVs above),
+not a guessed generalization.
 
 Week-number agnostic by design -- real calendar week numbers for each
 round are a separate, later concern (season length varies year to
@@ -44,6 +53,20 @@ EIGHT_TEAM_BRACKET: list[GameSpec] = [
     GameSpec(8, 3, loser_of(4), loser_of(5), winner_place=3, loser_place=4),
 ]
 
+# Same shape as EIGHT_TEAM_BRACKET with its "7-seed vs 8-seed" placement
+# game (and seeds 7/8 themselves) removed -- every other game, round, and
+# placement maps 1:1. Game numbers here match playoff_games.csv's POG#
+# directly for traceability back to the confirmed design.
+SIX_TEAM_BRACKET: list[GameSpec] = [
+    GameSpec(1, 1, seed(3), seed(6)),                                          # POG1
+    GameSpec(2, 1, seed(4), seed(5)),                                          # POG2
+    GameSpec(3, 2, loser_of(1), loser_of(2), winner_place=5, loser_place=6),   # POG3
+    GameSpec(4, 2, seed(1), winner_of(2)),                                     # POG4
+    GameSpec(5, 2, seed(2), winner_of(1)),                                     # POG5
+    GameSpec(6, 3, loser_of(4), loser_of(5), winner_place=3, loser_place=4),   # POG6
+    GameSpec(7, 3, winner_of(4), winner_of(5), winner_place=1, loser_place=2), # POG7
+]
+
 
 # ------------------------------------------------------------------
 # Seed assignment
@@ -62,22 +85,28 @@ def assign_seeds_4_team(seeding: list[dict]) -> dict[int, int]:
     return {row['seed']: row['player_id'] for row in seeding}
 
 
-def assign_seeds_8_team(seeding: list[dict], pod_of_player: dict[int, int]) -> dict[int, int]:
+def _assign_seeds_two_pod(seeding: list[dict], pod_of_player: dict[int, int]) -> dict[int, int]:
     """
-    seeding: lib.seeding.compute_seeding() output across BOTH pods
-    combined (8 players, overall-rank order). pod_of_player:
-    {player_id: pod_id}, exactly 2 distinct pods expected among the 8.
+    Shared algorithm behind assign_seeds_6_team/assign_seeds_8_team --
+    size-agnostic, works for any total player count as long as exactly 2
+    pods are present. seeding: lib.seeding.compute_seeding() output
+    across both pods combined (overall-rank order). pod_of_player:
+    {player_id: pod_id}.
 
     Seed 1 = seeding[0] (overall #1), whichever pod.
     Seed 2 = first remaining player (in overall-rank order) whose pod
       differs from seed 1's -- NOT necessarily overall #2.
-    Seeds 3-8 = everyone else remaining, in original overall-rank order.
+    Seeds 3-N = everyone else remaining, in original overall-rank order.
 
-    Returns {bracket_seed (1-8): player_id}.
+    This is algebraically equivalent to "each pod's own winner gets
+    seed 1 or 2 (better overall pod first), everyone else keeps their
+    relative overall order for seeds 3-N" -- a pod's own top finisher is
+    always the first member of that pod encountered walking the full
+    overall order, so "first remaining player from the other pod" and
+    "that pod's own winner" are always the same player.
+
+    Returns {bracket_seed (1-N): player_id}.
     """
-    if len(seeding) != 8:
-        raise ValueError(f"8-team format requires exactly 8 players, got {len(seeding)}")
-
     remaining = list(seeding)
     seed1_row = remaining.pop(0)
     seed1_pod = pod_of_player[seed1_row['player_id']]
@@ -95,6 +124,20 @@ def assign_seeds_8_team(seeding: list[dict], pod_of_player: dict[int, int]) -> d
     return {i + 1: row['player_id'] for i, row in enumerate(ordered)}
 
 
+def assign_seeds_6_team(seeding: list[dict], pod_of_player: dict[int, int]) -> dict[int, int]:
+    """seeding must be exactly 6 players (2 pods of 3) -- see _assign_seeds_two_pod."""
+    if len(seeding) != 6:
+        raise ValueError(f"6-team format requires exactly 6 players, got {len(seeding)}")
+    return _assign_seeds_two_pod(seeding, pod_of_player)
+
+
+def assign_seeds_8_team(seeding: list[dict], pod_of_player: dict[int, int]) -> dict[int, int]:
+    """seeding must be exactly 8 players (2 pods of 4) -- see _assign_seeds_two_pod."""
+    if len(seeding) != 8:
+        raise ValueError(f"8-team format requires exactly 8 players, got {len(seeding)}")
+    return _assign_seeds_two_pod(seeding, pod_of_player)
+
+
 def compute_4_team_placements(
     seed_to_player: dict[int, int], results: dict[int, GameResult],
 ) -> dict[int, int]:
@@ -110,25 +153,39 @@ def compute_4_team_placements(
 # ------------------------------------------------------------------
 # Format dispatch -- shared by scripts/generate_pvp_schedule.py,
 # scripts/seed_playoffs.py, and scripts/advance_playoffs.py so the
-# "1 pod -> four_team, 2 pods -> eight_team, else error" and "is the
-# bracket fully decided yet" logic isn't duplicated three times.
+# "which (pod count, player count) maps to which bracket format" and
+# "is the bracket fully decided yet" logic isn't duplicated three times.
 # ------------------------------------------------------------------
 
 BRACKET_SPECS: dict[str, list[GameSpec]] = {
     'four_team': FOUR_TEAM_BRACKET,
+    'six_team': SIX_TEAM_BRACKET,
     'eight_team': EIGHT_TEAM_BRACKET,
 }
-PLAYOFF_ROUND_COUNT: dict[str, int] = {'four_team': 2, 'eight_team': 3}
-EXHIBITION_GAME_COUNT: dict[str, int] = {'four_team': 1, 'eight_team': 2}
+PLAYOFF_ROUND_COUNT: dict[str, int] = {'four_team': 2, 'six_team': 3, 'eight_team': 3}
+EXHIBITION_GAME_COUNT: dict[str, int] = {'four_team': 1, 'six_team': 1, 'eight_team': 2}
+
+# (n_pods, n_players) -> bracket format, for every combination with a
+# confirmed design. A season can move between any of these (e.g. back to
+# 2 pods of 4 after a season of 2 pods of 3) purely via season-init
+# config -- no code change. A genuinely new combination needs a new
+# confirmed bracket design added here, not a guessed generalization.
+_LEAGUE_SHAPE_TO_FORMAT: dict[tuple[int, int], str] = {
+    (1, 4): 'four_team',
+    (2, 6): 'six_team',
+    (2, 8): 'eight_team',
+}
 
 
-def bracket_format_for_pod_count(n_pods: int) -> str:
-    """'four_team' for 1 pod, 'eight_team' for 2 pods; raises ValueError otherwise."""
-    if n_pods == 1:
-        return 'four_team'
-    if n_pods == 2:
-        return 'eight_team'
-    raise ValueError(f"playoffs only support 1 or 2 pods, got {n_pods}")
+def bracket_format_for_league_shape(n_pods: int, n_players: int) -> str:
+    """Bracket format for a given (pod count, total player count); raises
+    ValueError if that combination has no confirmed design yet."""
+    try:
+        return _LEAGUE_SHAPE_TO_FORMAT[(n_pods, n_players)]
+    except KeyError:
+        raise ValueError(
+            f"no confirmed playoff bracket format for {n_pods} pod(s) / {n_players} total players"
+        )
 
 
 def compute_final_placements(
@@ -138,15 +195,16 @@ def compute_final_placements(
     Full 1-N placement dict once every placement is decided, else None.
     Unlike compute_placements()/compute_4_team_placements(), which return
     whatever's decided so far, this is a clean "is the bracket over yet"
-    check -- useful since eight_team's places 5-8 are known well before
-    the championship (G7/G8) finishes.
+    check -- useful since eight_team's places 5-8 (six_team's 5-6) are
+    known well before the championship finishes.
     """
     if bracket_format == 'four_team':
         placements = compute_4_team_placements(seed_to_player, results)
         expected = expected_placements(FOUR_TEAM_BRACKET) | {4}
     else:
-        placements = compute_placements(EIGHT_TEAM_BRACKET, seed_to_player, results)
-        expected = expected_placements(EIGHT_TEAM_BRACKET)
+        spec = BRACKET_SPECS[bracket_format]
+        placements = compute_placements(spec, seed_to_player, results)
+        expected = expected_placements(spec)
     return placements if set(placements) == expected else None
 
 
@@ -255,8 +313,9 @@ def find_exhibition_pairing(
     Pairs up players who are already fully eliminated with no game
     scheduled for the final playoff week, so nobody sits idle.
 
-    Exactly 2 idle players (4-team format): returns the single trivial
-    pair -- nothing to optimize.
+    Exactly 2 idle players (4-team and 6-team formats -- six_team's
+    already-decided 5th/6th finishers): returns the single trivial pair --
+    nothing to optimize.
 
     Exactly 4 idle players (8-team format): evaluates all 3 ways to
     split them into 2 pairs and picks the one that, in order --
@@ -269,9 +328,8 @@ def find_exhibition_pairing(
       5. (tiebreak) arbitrary but deterministic: lowest sorted-player-id
          ordering
 
-    Any other count of idle players raises ValueError -- only the
-    4-team and 8-team formats are supported, matching the rest of this
-    module's stance.
+    Any other count of idle players raises ValueError -- only formats
+    with a confirmed 2- or 4-idle-player final week are supported.
     """
     if len(idle_players) == 2:
         a, b = idle_players

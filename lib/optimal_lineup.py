@@ -16,7 +16,8 @@ decision this depends on.
 
 Used for three retroactive comparisons against a real (or hypothetical)
 team pool for a week that's already final:
-  - a real player's own 25-team roster, to see how close their actual
+  - a real player's own full roster (size is season config, see
+    lib.db.get_draft_picks_per_player), to see how close their actual
     submitted lineup got to the best they could have done
   - "Scrappy": a pod's free-agent pool only
   - "Max": every FBS team that week, no roster constraint at all
@@ -214,8 +215,9 @@ def optimize_lineup(
     search to never settle (perpetually "improving" a distance by less
     than float precision can reliably represent) once enough preferred
     teams created enough tied/near-tied paths -- a real player's full
-    25-team roster reliably triggered it. Integer costs throughout
-    removes the possibility entirely.
+    roster (25 teams, at the time this was found) reliably triggered it.
+    Integer costs throughout removes the possibility entirely regardless
+    of roster size.
     """
     candidates = [t for t in teams if t.margin is not None and t.margin > 0]
     if not candidates:

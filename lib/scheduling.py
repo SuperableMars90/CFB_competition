@@ -5,10 +5,20 @@ Pure-Python PVP round-robin schedule generator. No DB access, no
 Streamlit -- callers (scripts/generate_pvp_schedule.py) fetch player/pod
 data and pass in plain player_id lists.
 
-Supports exactly two scenarios:
-  - single pod: everyone plays everyone `single_pod_repeats` times
+Supports two scheduling shapes, chosen per season/format (see
+lib.playoffs.bracket_format_for_league_shape) rather than one replacing
+the other -- 4-player-pod seasons keep the original tiered shape
+unchanged, 3-player-pod seasons use the flat shape:
+  - single pool: everyone plays everyone `single_pod_repeats` times.
+    `single_pod_players` doesn't have to be one real roster pod -- pass
+    an optional `pod_of_player` alongside it and matchup_type is derived
+    per pair from pod membership instead of hardcoded 'in_pod'. This is
+    how a flat 2-pod schedule (e.g. 2 pods of 3, everyone plays everyone
+    twice regardless of pod) is built, without touching the tiered
+    two-pod path below at all.
   - two pods (equal size): everyone plays their podmates
-    `two_pod_in_pod_repeats` times, and every opposite-pod player once
+    `two_pod_in_pod_repeats` times, and every opposite-pod player once --
+    the original 4-player-pod shape, unchanged.
 
 3+ pods are explicitly unsupported -- that's a caller-level concern
 (see scripts/generate_pvp_schedule.py), not handled here.
@@ -134,6 +144,7 @@ def interleave_pvp_weeks(n_in: int, n_cross: int, total_weeks: int) -> list[str]
 def build_pvp_schedule(
     *,
     single_pod_players: list[int] | None = None,
+    pod_of_player: dict[int, int] | None = None,
     pod_a: list[int] | None = None,
     pod_b: list[int] | None = None,
     regular_season_weeks: int = 11,
@@ -143,6 +154,13 @@ def build_pvp_schedule(
     """
     Top-level orchestrator. Exactly one of `single_pod_players` or
     (`pod_a` AND `pod_b`) must be given.
+
+    `pod_of_player` is only meaningful alongside `single_pod_players`
+    (ignored/unused with `pod_a`/`pod_b`, which already know their own
+    pod split): if given, each pair's matchup_type is 'in_pod' or
+    'cross_pod' based on `pod_of_player[a] == pod_of_player[b]`; if
+    omitted, every pair is labeled 'in_pod' (correct for a genuine
+    single-pod season, where that's the only possibility).
 
     Returns {week: [(player_a_id, player_b_id, matchup_type), ...]} for
     week in 1..regular_season_weeks. Bye weeks map to an empty list.
@@ -156,7 +174,14 @@ def build_pvp_schedule(
 
     if single_pod_given:
         rounds = repeat_rounds(circle_method_round_robin(single_pod_players), single_pod_repeats)
-        in_pod_rounds = [[(a, b, 'in_pod') for a, b in rnd] for rnd in rounds]
+        if pod_of_player is not None:
+            in_pod_rounds = [
+                [(a, b, 'in_pod' if pod_of_player[a] == pod_of_player[b] else 'cross_pod')
+                 for a, b in rnd]
+                for rnd in rounds
+            ]
+        else:
+            in_pod_rounds = [[(a, b, 'in_pod') for a, b in rnd] for rnd in rounds]
         cross_rounds: list[list[tuple[int, int, str]]] = []
     else:
         if pod_a is None or pod_b is None:

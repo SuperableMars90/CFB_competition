@@ -29,7 +29,12 @@ Run in this order — each step depends on the one before it.
    Optional flags: `--week0-ids`/`--week0-file` (CFBD game IDs played
    in the season's opening week-0 slate), `--overrides` (canonical name
    corrections), `--week0-cutoff` (which week undeployed week-0
-   elections must be resolved by — default 4).
+   elections must be resolved by — default 4), `--draft-picks-per-player`
+   (draft length / active roster size per player — **default 25**, for
+   4-player pods; pass `--draft-picks-per-player 30` for a 3-player-pod
+   season). This is `seasons.draft_picks_per_player` (added 2026-08, see
+   `transition_plan.md`) — set once here at season creation, not editable
+   from the app afterward without a direct SQL update.
 
 2. **Assign P4/G6 tiers to conferences — direct SQL, no script.**
    The script's own docstring mentions an `--assign-tiers` flag; it
@@ -50,7 +55,17 @@ Run in this order — each step depends on the one before it.
    ```
    One pod = no split needed, just make sure exactly one `pods` row
    exists for the season (multi-pod scoring requires exactly 2 — see
-   `lib/metagame.py: compute_pod_standings()`).
+   `lib/metagame.py: compute_pod_standings()`). Pod *count* and pod *size*
+   are independent settings: 2 pods works whether each pod has 3 or 4
+   players (or any other size), size is just however many
+   `pod_memberships` rows you create per pod in the next step. The
+   combination of (pod count, total players across all pods) has to be
+   one with a confirmed playoff bracket format though — currently
+   1 pod/4 players (`four_team`), 2 pods/6 players (`six_team`), or
+   2 pods/8 players (`eight_team`); see
+   `lib.playoffs.bracket_format_for_league_shape`. Anything else raises
+   an error at PVP-schedule-generation time (step 8) rather than
+   guessing a shape.
 
 4. **Create player rows and pod memberships — direct SQL, no script.**
    ```sql
@@ -63,11 +78,22 @@ Run in this order — each step depends on the one before it.
 
 5. **Seed the scoring context — direct SQL, no script.**
    ```sql
+   -- 2 pods of 4 (8 total players, eight_team playoffs):
    INSERT INTO scoring_contexts (season_id, name, scoring_type, points_map)
    VALUES (8, 'cross_pod_8player', 'match_play_pod', '[7,6,5,4,3,2,1,0]');
+
+   -- 2 pods of 3 (6 total players, six_team playoffs):
+   INSERT INTO scoring_contexts (season_id, name, scoring_type, points_map)
+   VALUES (9, 'cross_pod_6player', 'match_play_pod', '[5,4,3,2,1,0]');
    ```
    Use `scoring_type = 'match_play_pod'` for a 2-pod season,
-   `'match_play'` for single-pod.
+   `'match_play'` for single-pod. `points_map` is base match-play points
+   by overall rank (index 0 = 1st place) — `compute_pod_standings()`
+   stacks up to three +1 bonuses on top (pod winner, pod-vs-pod, overall
+   winner), so max weekly total is `points_map[0] + 3`. The `[5,4,3,2,1,0]`
+   ladder above is a confirmed decision (Zach, 2026-08-09) for the 6-player
+   format, not a placeholder — same "1 point per spot" logic as the
+   8-player ladder, just for 6 total players (max weekly total 8, not 10).
 
 6. **(Optional) Export the pre-draft schedule guide:**
    ```bash
@@ -101,6 +127,13 @@ Run in this order — each step depends on the one before it.
    schedule (round count, bye weeks, matchup counts) before writing.
    `--scoring-context` defaults to the season's active context from
    step 5 if only one exists; pass it explicitly if there's ambiguity.
+   Bracket format (and therefore scheduling shape) is auto-detected from
+   your pods/players, not a flag — `--single-pod-repeats` (default 3,
+   `four_team`), `--two-pod-in-pod-repeats` (default 2, `eight_team`),
+   and `--six-team-repeats` (default 2, `six_team` — a flat schedule
+   where everyone plays everyone this many times regardless of pod, per
+   `transition_plan.md`'s confirmed design) only matter for whichever
+   one actually applies to this season.
 
 You should now have a season ready for Week 1 lineups.
 
@@ -145,9 +178,9 @@ You should now have a season ready for Week 1 lineups.
    python scripts/seed_playoffs.py --season 2026
    ```
    Computes final standings, assigns bracket seeds (pod-aware for the
-   8-team format), and resolves every seed-sourced bracket placeholder
-   to a real player. **Refuses to run if the regular season isn't
-   actually fully scored yet** — that's intentional, not a bug.
+   `six_team`/`eight_team` formats), and resolves every seed-sourced
+   bracket placeholder to a real player. **Refuses to run if the regular
+   season isn't actually fully scored yet** — that's intentional, not a bug.
 
 2. **If step 1 raises `UnresolvedTieError`:**
    ```bash
