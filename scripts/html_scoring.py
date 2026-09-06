@@ -47,6 +47,7 @@ from lib.db import (
     get_pod_membership_map,
     get_pod_vs_pod_bonus_by_week,
     get_pods,
+    get_team_week_results,
 )
 from lib.scoring import _slot_group
 from lib.metagame import get_scoring_context, compute_weekly_standings, build_season_leaderboard
@@ -55,12 +56,14 @@ from lib.optimal_lineup import P4_FLEX_CATEGORY, G6_FLEX_CATEGORY, WILDCARD_CATE
 from lib.performance import compute_max_optimal
 from lib.recap import (
     build_overall_results,
+    build_pod_play_breakdown,
     build_pod_vs_pod_summary,
     build_player_recap,
     build_pvp_matchups_table,
     build_scrappy_by_pod,
-    build_top_free_agents,
-    build_top_unplayed_winners,
+    build_unplayed_games,
+    compare_players_by_slot_points,
+    compare_players_by_teams,
     tally_pick_record,
 )
 
@@ -94,6 +97,17 @@ def _slot_label(slot_type: str, conference_slug: Optional[str]) -> str:
     if slot_type == 'wildcard':
         return 'WC'
     return '—'
+
+
+def _category_label(category: str) -> str:
+    """Display name for an optimal-lineup category -- the flex/wildcard
+    sentinels get friendly names, a conference abbreviation passes
+    through as-is."""
+    return {
+        P4_FLEX_CATEGORY: 'P4 Flex',
+        G6_FLEX_CATEGORY: 'G6 Flex',
+        WILDCARD_CATEGORY: 'Wild Card',
+    }.get(category, category)
 
 
 def _margin_fmt(margin: Optional[int]) -> str:
@@ -220,6 +234,7 @@ def _build_slot(row: dict, live_scores: dict) -> dict:
     if is_pass:
         return {
             'label': _slot_label(row['slot_type'], row['conference_slug']),
+            'slot_type': row['slot_type'],
             'group': group,
             'team': 'PASS',
             'is_pass': True,
@@ -259,6 +274,7 @@ def _build_slot(row: dict, live_scores: dict) -> dict:
 
     return {
         'label': _slot_label(row['slot_type'], row['conference_slug']),
+        'slot_type': row['slot_type'],
         'group': group,
         'team': row['team_name'],
         'is_pass': False,
@@ -834,12 +850,38 @@ def _build_recap_payload(
 
     player_ids = [s['player_id'] for s in summaries]
     player_names = {s['player_id']: s['name'] for s in summaries}
-    top_unplayed_winners = build_top_unplayed_winners(
-        season_id, week, player_ids, player_names, pod_of_player, pod_names_map, lineup_team_ids_by_player,
+    unplayed_games = build_unplayed_games(
+        season_id, week, player_ids, player_names, pod_of_player, pod_names_map,
+        lineup_team_ids_by_player, pods, conference_slot_tiers,
     )
-    free_agents_by_pod = {
-        pod['name']: _week_result_payload(build_top_free_agents(season_id, week, pod['id']))
-        for pod in pods
+    pod_play = build_pod_play_breakdown(
+        season_id, week, lineup_team_ids_by_player, pod_of_player, player_names, pods,
+    )
+
+    # Pick Similarity -- one set of DB reads (per-team margins for every
+    # team anyone started) feeds both subsections.
+    all_started_ids = sorted({tid for ids in lineup_team_ids_by_player.values() for tid in ids})
+    started_results = get_team_week_results(season_id, week, all_started_ids)
+    team_margin = {r['team_id']: r['margin'] for r in started_results}
+    team_meta = {
+        r['team_id']: {'name': r['name'], 'conference': r['conference_abbreviation']}
+        for r in started_results
+    }
+    slots_by_player = {
+        s['player_id']: [
+            {'slot_type': sl['slot_type'], 'label': sl['label'], 'margin': sl['margin']}
+            for sl in s['slots']
+        ]
+        for s in summaries
+    }
+    pick_similarity = {
+        'byTeams': compare_players_by_teams(
+            lineup_team_ids_by_player, team_margin, team_meta, player_names,
+            pod_of_player, pod_names_map,
+        ),
+        'bySlotPoints': compare_players_by_slot_points(
+            slots_by_player, player_names, pod_of_player, pod_names_map,
+        ),
     }
 
     return {
@@ -854,11 +896,24 @@ def _build_recap_payload(
             'total': max_result.total,
             'picks': _optimal_picks_payload(max_result.picks, conference_slot_tiers),
         },
-        'topUnplayedWinners': [{
-            'teamId': r['team_id'], 'teamName': r['name'], 'conference': r['conference_abbreviation'],
-            'margin': r['margin'], 'playerName': r['player_name'], 'podName': r['pod_name'],
-        } for r in top_unplayed_winners],
-        'freeAgentsByPod': free_agents_by_pod,
+        'unplayedGames': {
+            'redundant': [{
+                'teamName': r['team_name'], 'conference': r['conference'], 'score': r['score'],
+                'playerName': r['player_name'], 'podName': r['pod_name'],
+            } for r in unplayed_games['redundant']],
+            'wasted': [{
+                'teamName': r['team_name'], 'conference': r['conference'], 'gain': r['gain'],
+                'replacedCategory': _category_label(r['replaced_category']),
+                'replacedTeam': r['replaced_team'],
+                'playerName': r['player_name'], 'podName': r['pod_name'],
+            } for r in unplayed_games['wasted']],
+            'unowned': [{
+                'teamName': r['team_name'], 'conference': r['conference'],
+                'margin': r['margin'], 'pod': r['pod'],
+            } for r in unplayed_games['unowned']],
+        },
+        'podPlay': pod_play,
+        'pickSimilarity': pick_similarity,
     }
 
 
@@ -1626,16 +1681,71 @@ _RECAP_PAGE_TEMPLATE = """<!-- wp:html -->
     <p class="cfb-section-label">Max &mdash; Best Possible Lineup, Any FBS Team</p>
     <div id="cfb-max-lineup"></div>
 
-    <p class="cfb-section-label">Top 10 Owned, Unplayed Winners (League-Wide)</p>
+    <p class="cfb-section-label">Unplayed Games</p>
+
+    <p class="cfb-subsection-label">Redundant &mdash; scored on the bench, but no slot could use them</p>
     <div class="cfb-table-scroll">
       <table class="cfb-standings">
-        <thead><tr><th>Team</th><th>Conf</th><th class="cfb-num">Margin</th><th>Owner</th><th>Pod</th></tr></thead>
-        <tbody id="cfb-unplayed-winners-body"></tbody>
+        <thead><tr><th>Team</th><th>Conf</th><th class="cfb-num">Net</th><th>Owner</th><th>Pod</th></tr></thead>
+        <tbody id="cfb-redundant-body"></tbody>
       </table>
     </div>
 
-    <p class="cfb-section-label">Top 10 Free Agents by Pod</p>
-    <div class="cfb-pod-row" id="cfb-free-agents-row"></div>
+    <p class="cfb-subsection-label">Wasted &mdash; a bench team that could have been swapped in</p>
+    <div class="cfb-table-scroll">
+      <table class="cfb-standings">
+        <thead><tr><th>Team</th><th>Conf</th><th class="cfb-num">Pts&nbsp;Gained</th><th>Instead&nbsp;Of</th><th>Owner</th><th>Pod</th></tr></thead>
+        <tbody id="cfb-wasted-body"></tbody>
+      </table>
+    </div>
+
+    <p class="cfb-subsection-label">Top Unowned Scores (League-Wide)</p>
+    <div class="cfb-table-scroll">
+      <table class="cfb-standings">
+        <thead><tr><th>Team</th><th>Conf</th><th class="cfb-num">Net</th><th>Free&nbsp;Agent&nbsp;In</th></tr></thead>
+        <tbody id="cfb-unowned-body"></tbody>
+      </table>
+    </div>
+
+    <div id="cfb-podplay-section" hidden>
+      <p class="cfb-section-label">Games by Pod &amp; Ownership</p>
+      <div id="cfb-podplay-categories"></div>
+      <div id="cfb-podplay-matchups"></div>
+    </div>
+
+    <div id="cfb-picksim-section" hidden>
+      <p class="cfb-section-label">Pick Similarity</p>
+
+      <div id="cfb-picksim-teams-wrap" hidden>
+        <p class="cfb-subsection-label">Cross-Pod &mdash; Same Teams Picked</p>
+        <p class="cfb-empty-note" style="margin-bottom:8px;">Which teams two players both picked this week, regardless of the slot each used. Same-pod players can't share a team.</p>
+
+        <p class="cfb-eyebrow" style="margin:12px 0 4px;">Ranked by matching teams</p>
+        <div class="cfb-table-scroll">
+          <table class="cfb-standings">
+            <thead><tr><th>Pair</th><th class="cfb-num">Matching</th><th class="cfb-num">Shared&nbsp;Impact</th><th>Shared Teams</th></tr></thead>
+            <tbody id="cfb-picksim-teams-count"></tbody>
+          </table>
+        </div>
+
+        <p class="cfb-eyebrow" style="margin:16px 0 4px;">Ranked by shared impact (&Sigma; |margin|)</p>
+        <div class="cfb-table-scroll">
+          <table class="cfb-standings">
+            <thead><tr><th>Pair</th><th class="cfb-num">Shared&nbsp;Impact</th><th class="cfb-num">Matching</th><th>Shared Teams</th></tr></thead>
+            <tbody id="cfb-picksim-teams-impact"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <p class="cfb-subsection-label">Every Pair &mdash; Points Per Slot</p>
+      <p class="cfb-empty-note" style="margin-bottom:8px;">Slot for slot, how close were the points? Conference slots pair by conference; the flex slots pair best-to-best by margin. Lower distance = more alike. Same-direction slots are where both picks won, both lost, or both hit zero.</p>
+      <div class="cfb-table-scroll">
+        <table class="cfb-standings">
+          <thead><tr><th>Pair</th><th class="cfb-num">Slot&nbsp;Pt&nbsp;Distance</th><th class="cfb-num">Same-Direction&nbsp;Slots</th></tr></thead>
+          <tbody id="cfb-picksim-slots-body"></tbody>
+        </table>
+      </div>
+    </div>
 
     <p class="cfb-section-label">Player Detail</p>
     <div class="cfb-toolbar">
@@ -1815,29 +1925,143 @@ _RECAP_PAGE_TEMPLATE = """<!-- wp:html -->
     '<p class="cfb-empty-note" style="margin-bottom:10px;">Total: <b>' + fmtSigned(DATA.maxLineup.total) + '</b> &middot; no roster constraint, every FBS team eligible.</p>' +
     groupPicksTable('P4', maxGroups.p4, false) + groupPicksTable('G6', maxGroups.g6, false) + groupPicksTable('Wildcard', maxGroups.wc, false);
 
-  // ---- Top 10 unplayed winners (league-wide) ----
-  document.getElementById('cfb-unplayed-winners-body').innerHTML = DATA.topUnplayedWinners.length
-    ? DATA.topUnplayedWinners.map(function (t) {
-        return '<tr><td><b>' + t.teamName + '</b></td><td>' + t.conference + '</td>' +
-          '<td class="cfb-num">' + fmtSigned(t.margin) + '</td><td>' + t.playerName + '</td>' +
-          '<td>' + podChip(t.podName) + (t.podName || '') + '</td></tr>';
-      }).join('')
-    : '<tr><td colspan="5" class="cfb-empty-note">Nothing left on the bench this week.</td></tr>';
+  // ---- Unplayed Games: redundant / wasted / unowned ----
+  var ug = DATA.unplayedGames;
 
-  // ---- Top 10 free agents by pod ----
-  var podNamesFA = Object.keys(DATA.freeAgentsByPod);
-  document.getElementById('cfb-free-agents-row').innerHTML = podNamesFA.map(function (podName) {
-    var cls = /orange/i.test(podName) ? 'is-orange' : 'is-white';
-    var rows = DATA.freeAgentsByPod[podName];
-    var body = rows.length
-      ? rows.map(function (t) {
-          return '<tr><td>' + t.teamName + ' <span class="cfb-dash">(' + t.conference + ')</span></td>' +
-            '<td class="cfb-num">' + fmtSigned(t.margin) + '</td></tr>';
-        }).join('')
-      : '<tr><td colspan="2" class="cfb-empty-note">No positive-margin free agents this week.</td></tr>';
-    return '<div class="cfb-pod-card ' + cls + '"><h3>' + podName + '</h3>' +
-      '<table class="cfb-slots"><tbody>' + body + '</tbody></table></div>';
-  }).join('');
+  document.getElementById('cfb-redundant-body').innerHTML = ug.redundant.length
+    ? ug.redundant.map(function (r) {
+        return '<tr><td><b>' + r.teamName + '</b></td><td>' + r.conference + '</td>' +
+          '<td class="cfb-num cfb-margin pos">' + fmtSigned(r.score) + '</td>' +
+          '<td>' + r.playerName + '</td>' +
+          '<td>' + podChip(r.podName) + (r.podName || '') + '</td></tr>';
+      }).join('')
+    : '<tr><td colspan="5" class="cfb-empty-note">Nothing scored on a bench that had no slot to go to.</td></tr>';
+
+  document.getElementById('cfb-wasted-body').innerHTML = ug.wasted.length
+    ? ug.wasted.map(function (r) {
+        var instead = r.replacedTeam
+          ? r.replacedTeam + ' <span class="cfb-dash">(' + r.replacedCategory + ')</span>'
+          : 'an open ' + r.replacedCategory + ' slot';
+        return '<tr><td><b>' + r.teamName + '</b></td><td>' + r.conference + '</td>' +
+          '<td class="cfb-num cfb-margin pos">' + fmtSigned(r.gain) + '</td>' +
+          '<td>' + instead + '</td>' +
+          '<td>' + r.playerName + '</td>' +
+          '<td>' + podChip(r.podName) + (r.podName || '') + '</td></tr>';
+      }).join('')
+    : '<tr><td colspan="6" class="cfb-empty-note">Every bench team was used as well as it could have been.</td></tr>';
+
+  document.getElementById('cfb-unowned-body').innerHTML = ug.unowned.length
+    ? ug.unowned.map(function (r) {
+        var mcls = r.margin > 0 ? 'pos' : (r.margin < 0 ? 'neg' : '');
+        return '<tr><td><b>' + r.teamName + '</b></td><td>' + r.conference + '</td>' +
+          '<td class="cfb-num cfb-margin ' + mcls + '">' + fmtSigned(r.margin) + '</td>' +
+          '<td>' + r.pod + '</td></tr>';
+      }).join('')
+    : '<tr><td colspan="4" class="cfb-empty-note">No free-agent games this week.</td></tr>';
+
+  // ---- Games by Pod & Ownership (two-pod seasons only) ----
+  if (DATA.podPlay) {
+    document.getElementById('cfb-podplay-section').hidden = false;
+
+    var playersByPodStr = function (players) {
+      var byPod = {};
+      (players || []).forEach(function (p) {
+        (byPod[p.podName] = byPod[p.podName] || []).push(p.playerName);
+      });
+      return Object.keys(byPod).map(function (pn) {
+        return podChip(pn) + '<span class="cfb-dash">' + pn + ':</span> ' + byPod[pn].join(', ');
+      }).join(' &nbsp; ') || '<span class="cfb-dash">&mdash;</span>';
+    };
+    var netCell = function (m) {
+      var cls = m > 0 ? 'pos' : (m < 0 ? 'neg' : '');
+      return '<td class="cfb-num cfb-margin ' + cls + '">' + (m == null ? '&mdash;' : fmtSigned(m)) + '</td>';
+    };
+
+    document.getElementById('cfb-podplay-categories').innerHTML = DATA.podPlay.categories.map(function (c) {
+      var body = c.rows.length
+        ? c.rows.map(function (r) {
+            return '<tr><td><b>' + r.teamName + '</b></td><td>' + (r.conference || '') + '</td>' +
+              netCell(r.margin) + '<td>' + playersByPodStr(r.players) + '</td></tr>';
+          }).join('')
+        : '<tr><td colspan="4" class="cfb-empty-note">None this week.</td></tr>';
+      return '<p class="cfb-subsection-label">' + c.label + ' <span class="cfb-dash">(' + c.rows.length + ')</span></p>' +
+        '<div class="cfb-table-scroll"><table class="cfb-standings">' +
+        '<thead><tr><th>Team</th><th>Conf</th><th class="cfb-num">Net</th><th>Started By</th></tr></thead>' +
+        '<tbody>' + body + '</tbody></table></div>';
+    }).join('');
+
+    var mrows = DATA.podPlay.matchups;
+    document.getElementById('cfb-podplay-matchups').innerHTML =
+      '<p class="cfb-subsection-label">Head-to-Head &mdash; both teams in a real game were started</p>' +
+      '<div class="cfb-table-scroll"><table class="cfb-standings">' +
+      '<thead><tr><th>Winner</th><th>Started By</th><th class="cfb-num">Net</th><th>Loser</th><th>Started By</th></tr></thead>' +
+      '<tbody>' + (mrows.length
+        ? mrows.map(function (m) {
+            return '<tr><td><b>' + m.teamName + '</b> <span class="cfb-dash">(' + (m.teamConference || '') + ')</span></td>' +
+              '<td>' + playersByPodStr(m.teamPlayers) + '</td>' +
+              netCell(m.teamMargin) +
+              '<td><b>' + m.oppName + '</b> <span class="cfb-dash">(' + (m.oppConference || '') + ')</span></td>' +
+              '<td>' + playersByPodStr(m.oppPlayers) + '</td></tr>';
+          }).join('')
+        : '<tr><td colspan="5" class="cfb-empty-note">No game this week had both teams started.</td></tr>') +
+      '</tbody></table></div>';
+  }
+
+  // ---- Pick Similarity ----
+  if (DATA.pickSimilarity) {
+    var sim = DATA.pickSimilarity;
+    var hasTeams = sim.byTeams && sim.byTeams.length;
+    var hasSlots = sim.bySlotPoints && sim.bySlotPoints.length;
+    if (hasTeams || hasSlots) {
+      document.getElementById('cfb-picksim-section').hidden = false;
+
+      var simPairCell = function (r) {
+        return '<td>' + podChip(r.aPodName) + r.aName +
+          ' <span class="cfb-dash">&amp;</span> ' + podChip(r.bPodName) + r.bName + '</td>';
+      };
+      var sharedTeamsCell = function (r) {
+        if (!r.sharedTeams.length) return '<td class="cfb-dash">&mdash;</td>';
+        return '<td>' + r.sharedTeams.map(function (t) {
+          if (t.margin == null) return t.teamName;
+          var cls = t.margin > 0 ? 'pos' : (t.margin < 0 ? 'neg' : '');
+          return t.teamName + ' <span class="cfb-margin ' + cls + '" style="font-weight:700;">' + fmtSigned(t.margin) + '</span>';
+        }).join('<span class="cfb-dash">, </span>') + '</td>';
+      };
+
+      if (hasTeams) {
+        document.getElementById('cfb-picksim-teams-wrap').hidden = false;
+
+        var byCount = sim.byTeams.slice().sort(function (a, b) {
+          return (b.matchingTeams - a.matchingTeams) || (b.sharedImpact - a.sharedImpact);
+        });
+        document.getElementById('cfb-picksim-teams-count').innerHTML = byCount.map(function (r) {
+          return '<tr>' + simPairCell(r) +
+            '<td class="cfb-num"><b>' + r.matchingTeams + '</b></td>' +
+            '<td class="cfb-num">' + r.sharedImpact + '</td>' +
+            sharedTeamsCell(r) + '</tr>';
+        }).join('');
+
+        var byImpact = sim.byTeams.slice().sort(function (a, b) {
+          return (b.sharedImpact - a.sharedImpact) || (b.matchingTeams - a.matchingTeams);
+        });
+        document.getElementById('cfb-picksim-teams-impact').innerHTML = byImpact.map(function (r) {
+          return '<tr>' + simPairCell(r) +
+            '<td class="cfb-num"><b>' + r.sharedImpact + '</b></td>' +
+            '<td class="cfb-num">' + r.matchingTeams + '</td>' +
+            sharedTeamsCell(r) + '</tr>';
+        }).join('');
+      }
+
+      if (hasSlots) {
+        // Already sorted by slotPointDistance asc on the Python side.
+        document.getElementById('cfb-picksim-slots-body').innerHTML = sim.bySlotPoints.map(function (r) {
+          return '<tr>' + simPairCell(r) +
+            '<td class="cfb-num"><b>' + r.slotPointDistance + '</b></td>' +
+            '<td class="cfb-num">' + r.sameDirectionSlots + '</td></tr>';
+        }).join('');
+      }
+    }
+  }
 
   // ---- Player detail cards ----
   var podFilterEl = document.getElementById('cfb-pod-filter');
@@ -1996,8 +2220,12 @@ def render_recap_fragment(
     pod results interleaved by total points), the season leaderboard,
     every player's final scorecard + their unplayed-roster-games list +
     their optimal-lineup comparison (which picks they actually played),
-    the league-wide "Max" lineup, the top 10 owned-but-unplayed winners,
-    and the top 10 free agents per pod. Same JSON-payload + shared-JS-
+    the league-wide "Max" lineup, the "Unplayed Games" block (three
+    league-wide top-10s: redundant / wasted bench points, and top unowned
+    scores), and -- for two-pod seasons -- the "Games by Pod & Ownership"
+    block (started teams split by other-pod play/ownership, plus
+    head-to-head games where both teams were started). Same JSON-payload +
+    shared-JS-
     renderer architecture as render_fragment() (T20), and the same
     Gutenberg Custom HTML wrapping -- see that function's docstring for
     why. Includes an empty, marker-bounded "Commissioner's Notes"

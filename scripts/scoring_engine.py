@@ -3,13 +3,18 @@ scripts/scoring_engine.py
 --------------------------
 Live scoring engine for the CFB Fantasy Game.
 
-Runs on game days: fetches the CFBD scoreboard every 5 minutes, scores all
-players' lineup picks for the week, writes a checkpoint to the week's JSON
-file, updates the score plot, and calls push_website_update().
+Runs on game days: fetches the CFBD scoreboard every 5 minutes while games are
+live, scores all players' lineup picks for the week, writes a checkpoint to
+the week's JSON file, updates the score plot, and calls push_website_update().
+When no tracked game is in progress, it sleeps until shortly before the next
+remaining game's kickoff instead of polling every 5 minutes — safe to start
+once and leave running across a whole multi-day slate (Thu/Fri games, a
+Saturday slate, then Sun/Mon) without hammering CFBD overnight.
 
 Usage:
-    python scripts/scoring_engine.py --season 1 --week 3
-    python scripts/scoring_engine.py --season 1 --week 3 --interval 300
+    python scripts/scoring_engine.py --week 3                     # uses lib.config.CURRENT_SEASON_ID
+    python scripts/scoring_engine.py --season 1 --week 3           # or target a specific season_id
+    python scripts/scoring_engine.py --week 3 --interval 300
 """
 
 import argparse
@@ -20,6 +25,37 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Suppress Streamlit's "bare mode" noise (lib/db.py's @st.cache_data-decorated
+# functions log a warning every time they run outside a real Streamlit session,
+# which is always true here — this script is a CLI process, not a served app).
+# Both messages say outright that they're safe to ignore. A logging.Logger
+# level/filter doesn't survive this: Streamlit tears down and rebuilds this
+# logger's handler on every single cache check, silently undoing any change
+# made via the standard logging API — so this filters at the stream itself,
+# which every rebuilt handler still writes through.
+_STREAMLIT_BARE_MODE_NOISE = (
+    'No runtime found, using MemoryCacheStorageManager',
+    'missing ScriptRunContext',
+)
+
+
+class _FilteredStderr:
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, s):
+        if any(noise in s for noise in _STREAMLIT_BARE_MODE_NOISE):
+            return
+        self._stream.write(s)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+sys.stderr = _FilteredStderr(sys.stderr)
+
+from dateutil import parser as date_parser
+
 import matplotlib
 matplotlib.use('Agg')   # headless — no display required
 import matplotlib.pyplot as plt
@@ -27,6 +63,7 @@ import matplotlib.dates as mdates
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+from lib.config import CURRENT_SEASON_ID
 from lib.db import get_connection, update_game_results, get_pod_membership_map
 from lib.scoring import (
     load_week_picks,
@@ -117,8 +154,19 @@ def fetch_live_scores(client: CFBDClient) -> dict[int, dict]:
     """
     Call the CFBD scoreboard endpoint and return a dict keyed by cfbd_game_id.
 
-    Each value: {status, home_points, away_points, home_id, away_id, period, clock}
-    Status values from CFBD: 'scheduled', 'in_progress', 'final' (or similar).
+    Each value: {status, home_points, away_points, home_id, away_id, period, clock,
+    start_date}. status is normalized to 'scheduled' / 'in_progress' / 'final'.
+
+    CFBD's /scoreboard GameStatus enum (per docs/cfbd-openapi.json) is actually
+    {scheduled, in_progress, completed} — it never returns 'final'. Every other
+    consumer in this codebase (_game_counts, _status_display, update_game_results,
+    the live status page's JS) was written expecting 'final', matching the
+    convention _fetch_final_scores() already normalizes to from the /games
+    endpoint's separate boolean `completed` field. Left unnormalized here, a
+    finished game's slot silently reverts to showing as "pending"/"not started"
+    the moment CFBD flips it from in_progress to completed, since nothing
+    downstream recognizes 'completed' as done. start_date is CFBD's raw ISO 8601
+    kickoff timestamp string (or None).
     """
     raw = client.get_scoreboard()
     scores: dict[int, dict] = {}
@@ -128,14 +176,18 @@ def fetch_live_scores(client: CFBDClient) -> dict[int, dict]:
             continue
         home = game.get('homeTeam', {})
         away = game.get('awayTeam', {})
+        status = game.get('status', 'scheduled')
+        if status == 'completed':
+            status = 'final'
         scores[gid] = {
-            'status': game.get('status', 'scheduled'),
+            'status': status,
             'home_points': home.get('points'),
             'away_points': away.get('points'),
             'home_cfbd_id': home.get('id'),
             'away_cfbd_id': away.get('id'),
             'period': game.get('period'),
             'clock': game.get('clock'),
+            'start_date': game.get('startDate'),
         }
     return scores
 
@@ -153,11 +205,13 @@ def run_checkpoint(state: dict, client: CFBDClient, include_all_games: bool = Fa
     checkpoint JSON for retrospective analysis (e.g. theoretical lineups).
     """
     live_scores = fetch_live_scores(client)
+    state['last_live_scores'] = live_scores
     now = datetime.now(timezone.utc)
 
-    # Mark any newly completed games
+    # Mark any newly completed games (fetch_live_scores() normalizes CFBD's
+    # 'completed' to 'final', so this only needs to check the one value)
     for gid, game in live_scores.items():
-        if game['status'] in ('final', 'completed'):
+        if game['status'] == 'final':
             state['completed_game_ids'].add(gid)
 
     scored = score_picks(state['picks'], live_scores)
@@ -405,6 +459,11 @@ def finalize_week(state: dict, client: CFBDClient) -> None:
     except Exception as e:
         print(f"[WARNING] WordPress recap push failed: {e}. Run --finalize-only to retry.")
 
+    try:
+        push_weekly_status_index(season_id)
+    except Exception as e:
+        print(f"[WARNING] Weekly status index page update failed: {e}")
+
 
 # ------------------------------------------------------------------
 # WordPress push
@@ -460,8 +519,121 @@ def push_recap_update(
 
 
 # ------------------------------------------------------------------
+# Weekly status index page
+# ------------------------------------------------------------------
+
+WEEKLY_STATUS_INDEX_SLUG = 'weekly-status'
+
+
+def push_weekly_status_index(season_id: int) -> None:
+    """
+    Rebuild the season's permanent "Weekly Status" page (a real WordPress
+    Page, linked from site nav, findable by clicking through the site) with
+    an index of every week's status/recap posts, newest first.
+
+    Fully regenerated from current state every call — same idempotent
+    "rebuild wholesale" approach as the Records page in html_records.py —
+    so a skipped or re-run push can't leave it stale or duplicated.
+    """
+    year = _get_season_year(season_id)
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT week FROM weekly_lineups WHERE season_id = %s ORDER BY week DESC",
+            (season_id,),
+        )
+        weeks = [row[0] for row in cur.fetchall()]
+        cur.close()
+
+    client = WordPressClient()
+
+    rows = []
+    for week in weeks:
+        status_post = client.get_by_slug('posts', f"{year}-week-{week}-status")
+        recap_post = client.get_by_slug('posts', f"{year}-week-{week}-recap")
+
+        links = []
+        if status_post:
+            links.append(f'<a href="{status_post["link"]}">Live Status</a>')
+        if recap_post:
+            links.append(f'<a href="{recap_post["link"]}">Recap</a>')
+        if not links:
+            continue
+
+        rows.append(f'<li><strong>Week {week}</strong> — {" | ".join(links)}</li>')
+
+    content = f'<h2>{year} Weekly Status</h2>\n<ul>\n' + '\n'.join(rows) + '\n</ul>'
+
+    existing = client.get_by_slug('pages', WEEKLY_STATUS_INDEX_SLUG)
+    if existing is None:
+        print(f"[WARNING] No WordPress page found at slug '{WEEKLY_STATUS_INDEX_SLUG}' — "
+              "create it once in WP admin, then this will keep it updated.")
+        return
+    client.update('pages', existing['id'], content)
+
+
+# ------------------------------------------------------------------
 # Scheduler
 # ------------------------------------------------------------------
+
+# How long before a game's scheduled kickoff to resume 5-minute polling,
+# in case it starts early or CFBD's listed time is slightly off.
+PRE_GAME_BUFFER_SECONDS = 10 * 60
+
+# Upper bound on a single sleep, regardless of how far off the next kickoff
+# is — keeps the process checking in periodically even if CFBD start-time
+# data is missing/wrong, rather than oversleeping for a full day.
+MAX_SLEEP_SECONDS = 6 * 60 * 60
+
+
+def compute_next_wake_seconds(state: dict, interval_seconds: int) -> tuple[int, str]:
+    """
+    Decide how long to sleep before the next checkpoint.
+
+    If any tracked, not-yet-complete game is currently in progress, keep the
+    normal polling cadence (interval_seconds). Otherwise, find the soonest
+    kickoff among remaining tracked games (from the last checkpoint's
+    scoreboard fetch) and sleep until shortly before it — this is what lets
+    the engine go quiet overnight between game days instead of polling every
+    5 minutes for nothing, without any hardcoded day-of-week logic.
+
+    Returns (seconds_to_sleep, human-readable reason).
+    """
+    live_scores = state.get('last_live_scores', {})
+    remaining_ids = state['live_game_ids'] - state['completed_game_ids']
+
+    if any(live_scores.get(gid, {}).get('status') == 'in_progress' for gid in remaining_ids):
+        return interval_seconds, "a tracked game is in progress"
+
+    next_kickoff = None
+    for gid in remaining_ids:
+        raw_start = live_scores.get(gid, {}).get('start_date')
+        if not raw_start:
+            continue
+        try:
+            start_dt = date_parser.isoparse(raw_start)
+        except (ValueError, TypeError):
+            continue
+        if next_kickoff is None or start_dt < next_kickoff:
+            next_kickoff = start_dt
+
+    if next_kickoff is None:
+        # No usable kickoff data (e.g. CFBD hasn't posted times yet) — fall
+        # back to normal polling rather than guessing.
+        return interval_seconds, "no kickoff data available for remaining games"
+
+    now = datetime.now(timezone.utc)
+    seconds_until_wake = (next_kickoff - now).total_seconds() - PRE_GAME_BUFFER_SECONDS
+
+    if seconds_until_wake <= interval_seconds:
+        return interval_seconds, "next kickoff is coming up soon"
+
+    sleep_seconds = min(int(seconds_until_wake), MAX_SLEEP_SECONDS)
+    reason = (f"no games in progress; next kickoff is {next_kickoff.isoformat()} "
+              f"(sleeping until ~{PRE_GAME_BUFFER_SECONDS // 60} min before)")
+    return sleep_seconds, reason
+
 
 def run_scheduler(
     season_id: int,
@@ -493,6 +665,12 @@ def run_scheduler(
     except Exception as e:
         print(f"[WARNING] Initial WordPress push failed: {e}")
 
+    try:
+        push_weekly_status_index(season_id)
+        print("Weekly status index page updated.")
+    except Exception as e:
+        print(f"[WARNING] Weekly status index page update failed: {e}")
+
     while True:
         try:
             run_checkpoint(state, client, include_all_games=include_all_games)
@@ -513,8 +691,9 @@ def run_scheduler(
             print("No live games to track this week. Stopping.")
             break
 
-        print(f"Next checkpoint in {interval_seconds}s.")
-        time.sleep(interval_seconds)
+        sleep_seconds, reason = compute_next_wake_seconds(state, interval_seconds)
+        print(f"Next checkpoint in {sleep_seconds}s ({reason}).")
+        time.sleep(sleep_seconds)
 
 
 # ------------------------------------------------------------------
@@ -544,7 +723,8 @@ def run_finalize_only(season_id: int, week: int) -> None:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='CFB Fantasy live scoring engine')
-    parser.add_argument('--season', type=int, required=True, help='season_id in DB')
+    parser.add_argument('--season', type=int, default=CURRENT_SEASON_ID,
+                        help=f'season_id in DB (default: {CURRENT_SEASON_ID}, the live season)')
     parser.add_argument('--week', type=int, required=True, help='Week number to score')
     parser.add_argument('--interval', type=int, default=300, help='Seconds between checkpoints (default 300)')
     parser.add_argument('--all-games', action='store_true',

@@ -12,6 +12,9 @@ place. Duplicate-team across slots is intentionally NOT filtered live (it
 makes dropdowns jump on rerun); it's caught by validate_lineup at review.
 """
 
+from datetime import timezone
+from zoneinfo import ZoneInfo
+
 import streamlit as st
 
 from lib.auth import get_logged_in_player
@@ -39,6 +42,21 @@ SELECT = "__SELECT__"
 PASS = "__PASS__"
 SELECT_LABEL = "— Select —"
 PASS_LABEL = "— Pass (scores 0) —"
+
+_EASTERN = ZoneInfo("America/New_York")
+
+
+def _format_submitted_at(dt):
+    """Render a weekly_lineups.submitted_at value in US Eastern time.
+
+    submitted_at is written by MySQL NOW(); the Aiven server runs on UTC, so
+    the value comes back as a naive-UTC datetime. Present it in Eastern with
+    an explicit EST/EDT label so players aren't left guessing the zone.
+    """
+    if not dt:
+        return "earlier"
+    eastern = dt.replace(tzinfo=timezone.utc).astimezone(_EASTERN)
+    return eastern.strftime("%b %d, %Y %I:%M %p %Z")
 
 st.title("Submit Weekly Lineup")
 
@@ -106,7 +124,7 @@ if stored is not None and stored.is_locked:
     st.stop()
 
 if stored is not None:
-    when = stored.submitted_at.strftime("%b %d, %Y %I:%M %p") if stored.submitted_at else "earlier"
+    when = _format_submitted_at(stored.submitted_at)
     st.info(
         f"You already have a lineup for week {week} (submitted {when}). "
         "Editing here and submitting will overwrite it."

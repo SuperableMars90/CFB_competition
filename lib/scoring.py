@@ -106,7 +106,12 @@ def load_week_picks(season_id: int, week: int) -> list[dict]:
             -- conference entry (covers passed conference slots where team_id is NULL)
             COALESCE(c.tier, c_slot.tier)       AS conference_tier,
             COALESCE(c.abbreviation, ls.conference_slug) AS conference_abbr,
-            -- Week 0 game fields (populated only when ls.game_id IS NOT NULL)
+            -- Fields for the game ls.game_id points at directly (populated
+            -- whenever ls.game_id IS NOT NULL — true for a deployed Week 0
+            -- election, but also for a normal current-week pick, since
+            -- submit_lineup.py resolves and stores that game_id too; the
+            -- games.is_week0 flag below is what actually distinguishes them).
+            g_w0.is_week0                       AS w0_is_week0_flag,
             g_w0.cfbd_game_id                   AS w0_cfbd_game_id,
             g_w0.home_team_id                   AS w0_home_team_id,
             g_w0.away_team_id                   AS w0_away_team_id,
@@ -150,18 +155,32 @@ def load_week_picks(season_id: int, week: int) -> list[dict]:
     slots = []
     for row in rows:
         is_pass = row['team_id'] is None
-        is_week0 = row['w0_internal_game_id'] is not None
+        game_id_is_set = row['w0_internal_game_id'] is not None
 
-        if is_week0:
+        # Game identity comes from whichever join actually has a row: the
+        # direct ls.game_id -> games FK when set, otherwise the current-week
+        # schedule view. This is a structural join question, independent of
+        # whether the game itself is historical.
+        if game_id_is_set:
             cfbd_game_id = row['w0_cfbd_game_id']
             home_team_id = row['w0_home_team_id']
             away_team_id = row['w0_away_team_id']
-            w0_home_score = row['w0_home_score']
-            w0_away_score = row['w0_away_score']
         else:
             cfbd_game_id = row['reg_cfbd_game_id']
             home_team_id = row['reg_home_team_id']
             away_team_id = row['reg_away_team_id']
+
+        # Whether to score this as a frozen historical result depends on the
+        # game's actual games.is_week0 flag, not on whether ls.game_id happens
+        # to be set — a normal current-week pick also carries a resolved
+        # game_id (see the SELECT comment above), so that alone doesn't mean
+        # "historical."
+        is_week0 = game_id_is_set and bool(row['w0_is_week0_flag'])
+
+        if is_week0:
+            w0_home_score = row['w0_home_score']
+            w0_away_score = row['w0_away_score']
+        else:
             w0_home_score = None
             w0_away_score = None
 

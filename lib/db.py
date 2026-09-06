@@ -337,6 +337,61 @@ def get_team_week_results(season_id: int, week: int, team_ids: Optional[list[int
     return results
 
 
+def get_week_team_games(season_id: int, week: int, team_ids: list[int]) -> dict[int, dict]:
+    """
+    {team_id: {'game_id', 'opponent_id', 'opponent_name', 'margin'}} for
+    each of team_ids that had a game this week -- teams on a bye are
+    simply absent. Opponent and margin are resolved straight from the
+    `games` table the same way get_team_week_results() does (no
+    dependence on v_team_weekly_schedule). margin is None when the game
+    has no final score yet.
+    """
+    if not team_ids:
+        return {}
+    placeholders = ", ".join(["%s"] * len(team_ids))
+    query = f"""
+        SELECT
+            t.id            AS team_id,
+            g.id            AS game_id,
+            g.home_team_id  AS home_team_id,
+            g.away_team_id  AS away_team_id,
+            g.home_score    AS home_score,
+            g.away_score    AS away_score,
+            ht.name_display AS home_name,
+            awt.name_display AS away_name
+        FROM teams t
+        JOIN games g
+            ON (g.home_team_id = t.id OR g.away_team_id = t.id)
+           AND g.season_id = t.season_id
+           AND g.week = %s
+        JOIN teams ht  ON ht.id  = g.home_team_id
+        JOIN teams awt ON awt.id = g.away_team_id
+        WHERE t.season_id = %s AND t.id IN ({placeholders})
+    """
+    with get_connection() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(query, [week, season_id, *team_ids])
+        rows = cur.fetchall()
+        cur.close()
+
+    games: dict[int, dict] = {}
+    for r in rows:
+        is_home = r['team_id'] == r['home_team_id']
+        if r['home_score'] is None or r['away_score'] is None:
+            margin = None
+        elif is_home:
+            margin = r['home_score'] - r['away_score']
+        else:
+            margin = r['away_score'] - r['home_score']
+        games[r['team_id']] = {
+            'game_id': r['game_id'],
+            'opponent_id': r['away_team_id'] if is_home else r['home_team_id'],
+            'opponent_name': r['away_name'] if is_home else r['home_name'],
+            'margin': margin,
+        }
+    return games
+
+
 @st.cache_data(ttl=300)
 def get_pods(season_id: int) -> list[dict]:
     """Return [{id, name}, ...] for every pod in this season."""
