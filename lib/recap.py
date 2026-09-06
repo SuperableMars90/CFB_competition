@@ -18,8 +18,24 @@ section can be added later without touching the existing ones):
   - build_player_recap()         -- one player's scorecard-adjacent data:
                                      unplayed roster games + optimal-lineup
                                      comparison (both, per player)
-  - build_top_unplayed_winners() -- league-wide, across all pods
-  - build_top_free_agents()      -- per pod
+  - build_unplayed_games()       -- the "Unplayed Games" block: three
+                                     league-wide top-10 lists (redundant /
+                                     wasted / unowned), each row pod-tagged
+  - build_pod_play_breakdown()   -- the "Games by Pod & Ownership" block
+                                     (two-pod seasons): every started team
+                                     split by other-pod play/ownership, plus
+                                     head-to-head games where both teams
+                                     were started
+  - compare_players_by_teams()   -- "Pick Similarity" subsection 1:
+                                     cross-pod player pairs compared by the
+                                     teams they picked, ignoring slot --
+                                     count of matching teams + summed
+                                     |margin| of the shared teams
+  - compare_players_by_slot_points() -- "Pick Similarity" subsection 2:
+                                     every player pair compared slot for
+                                     slot on the points each slot produced
+                                     (conference slots by conference, flex
+                                     slots ranked best-to-best)
   - lib.performance.compute_max_optimal() -- the Max lineup (reused as-is,
     no wrapper needed here)
 """
@@ -31,10 +47,26 @@ from typing import Optional
 from lib.db import (
     get_active_roster_teams,
     get_available_teams,
+    get_owned_team_ids,
     get_team_week_results,
+    get_week_team_games,
 )
-from lib.optimal_lineup import OptimalLineupResult
+from lib.optimal_lineup import (
+    G6_FLEX_CATEGORY,
+    P4_FLEX_CATEGORY,
+    WILDCARD_CATEGORY,
+    OptimalLineupResult,
+    TeamWeekResult,
+    _eligible_categories,
+)
 from lib.performance import compute_player_optimal, compute_scrappy_optimal
+
+# The 16-slot lineup shape (10 conference + 3 P4 flex + 2 G6 flex + 1 wild
+# card) is a fixed game rule, not pod-format config -- see CLAUDE.md.
+# These mirror optimize_lineup()'s same-named parameter defaults.
+_P4_FLEX_SLOTS = 3
+_G6_FLEX_SLOTS = 2
+_WILDCARD_SLOTS = 1
 
 
 def _resolve_matchup(m: dict) -> tuple:
@@ -268,7 +300,176 @@ def build_player_recap(season_id: int, week: int, player_id: int, lineup_team_id
     }
 
 
-def build_top_unplayed_winners(
+def _margin(team: TeamWeekResult) -> int:
+    """Margin as a plain int -- a bye (None) counts as 0, i.e. an
+    occupied-but-scoreless slot, never a help."""
+    return team.margin or 0
+
+
+def _slot_capacities(conference_slot_tiers: dict[str, str]) -> dict[str, int]:
+    """{category: number of slots}. One per conference, plus the fixed
+    flex / wild-card counts."""
+    caps = {abbr: 1 for abbr in conference_slot_tiers}
+    caps[P4_FLEX_CATEGORY] = _P4_FLEX_SLOTS
+    caps[G6_FLEX_CATEGORY] = _G6_FLEX_SLOTS
+    caps[WILDCARD_CATEGORY] = _WILDCARD_SLOTS
+    return caps
+
+
+def greedy_arrange_started_picks(
+    started: list[TeamWeekResult],
+    conference_slot_tiers: dict[str, str],
+) -> dict[str, list[TeamWeekResult]]:
+    """
+    Arrange one player's actually-started teams into the 16-slot
+    structure to maximise total, without the min-cost-flow machinery of
+    lib.optimal_lineup: each conference slot takes that player's best
+    still-unplaced team native to the conference (falling back to an
+    unplaced independent of the slot's tier), then P4 flex, G6 flex and
+    the wild card take the best unplaced tier-eligible teams left.
+
+    A deliberately "lazy" normalisation (Zach, 2026-09): once every
+    conference slot holds the best eligible team for that conference,
+    swapping a bench team into a flex or wild-card slot can't open up a
+    better placement in some other conference, so a single pairwise
+    comparison against this arrangement is enough to tell whether a
+    benched team could have helped -- no cascading re-solve needed.
+
+    Unlike optimize_lineup(), non-positive and bye picks are kept in
+    place: the arrangement has to reflect every slot the player really
+    used (a losing pick still occupied its slot), so a bench team gets
+    measured against what was actually there, not an idealised blank.
+
+    Independent teams eligible for several conference slots are placed
+    first-fit after natives; a rare over-subscription just leaves the odd
+    team unplaced (dropped from the result) -- acceptable here.
+    """
+    remaining = sorted(started, key=_margin, reverse=True)
+    arranged: dict[str, list[TeamWeekResult]] = {}
+
+    def take(pred) -> Optional[TeamWeekResult]:
+        for i, team in enumerate(remaining):
+            if pred(team):
+                return remaining.pop(i)
+        return None
+
+    for abbr, tier in conference_slot_tiers.items():
+        pick = take(lambda t, a=abbr: t.conference_abbreviation == a)
+        if pick is None:
+            pick = take(
+                lambda t, tr=tier: t.conference_abbreviation not in conference_slot_tiers
+                and t.tier == tr
+            )
+        if pick is not None:
+            arranged[abbr] = [pick]
+
+    for category, count, tiers in (
+        (P4_FLEX_CATEGORY, _P4_FLEX_SLOTS, ('P4',)),
+        (G6_FLEX_CATEGORY, _G6_FLEX_SLOTS, ('G6',)),
+        (WILDCARD_CATEGORY, _WILDCARD_SLOTS, ('P4', 'G6')),
+    ):
+        for _ in range(count):
+            pick = take(lambda t, tt=tiers: t.tier in tt)
+            if pick is not None:
+                arranged.setdefault(category, []).append(pick)
+
+    return arranged
+
+
+def classify_bench_team(
+    team: TeamWeekResult,
+    arranged: dict[str, list[TeamWeekResult]],
+    capacities: dict[str, int],
+    conference_slot_tiers: dict[str, str],
+) -> Optional[dict]:
+    """
+    Decide whether one benched team's points were 'wasted' (some slot it
+    was eligible for held a weaker team, so swapping it in would have
+    raised the total) or 'redundant' (every eligible slot already held a
+    team scoring at least as much -- the points had nowhere to go),
+    measured against `arranged` (greedy_arrange_started_picks() output).
+
+    Returns one of:
+      {'kind': 'wasted', 'gain': int, 'replaced_category': str,
+       'replaced_team': str | None}   -- best swap strictly positive;
+       replaced_team is None when the beaten slot was an outright pass.
+      {'kind': 'redundant', 'score': int}   -- best swap strictly
+       negative AND the team actually scored (margin > 0).
+      None   -- an exact wash (best swap == 0), or a team whose best swap
+       is negative but that didn't score: nothing to show.
+    """
+    margin = _margin(team)
+    best_gain: Optional[int] = None
+    best_category: Optional[str] = None
+    best_replaced: Optional[str] = None
+
+    for category in _eligible_categories(team, conference_slot_tiers):
+        occupants = arranged.get(category, [])
+        if len(occupants) < capacities.get(category, 0):
+            gain, replaced = margin, None            # a passed / unfilled slot
+        else:
+            weakest = min(occupants, key=_margin)
+            gain, replaced = margin - _margin(weakest), weakest.name
+        if best_gain is None or gain > best_gain:
+            best_gain, best_category, best_replaced = gain, category, replaced
+
+    if best_gain is None:
+        return None
+    if best_gain > 0:
+        return {
+            'kind': 'wasted',
+            'gain': best_gain,
+            'replaced_category': best_category,
+            'replaced_team': best_replaced,
+        }
+    if best_gain < 0 and margin > 0:
+        return {'kind': 'redundant', 'score': margin}
+    return None
+
+
+def _build_unowned_scores(
+    season_id: int,
+    week: int,
+    pods: list[dict],
+    pod_names: dict[int, str],
+    limit: int,
+) -> list[dict]:
+    """
+    Top `limit` teams with no roster owner this week, by net margin,
+    deduplicated to one row per team. `pod` is 'both' when the team is a
+    free agent in every pod, otherwise the pod name(s) it's available in
+    -- free agency is pod-scoped (pods are severed rosters), so a team
+    can be owned in one pod and a free agent in another.
+    """
+    unowned_in: dict[int, set[int]] = {}
+    for pod in pods:
+        for team in get_available_teams(season_id, pod['id']):
+            unowned_in.setdefault(team['team_id'], set()).add(pod['id'])
+    if not unowned_in:
+        return []
+
+    pod_count = len(pods)
+    rows = []
+    for r in get_team_week_results(season_id, week, list(unowned_in)):
+        if r['margin'] is None:
+            continue
+        pod_ids = unowned_in[r['team_id']]
+        if pod_count > 1 and len(pod_ids) == pod_count:
+            pod_label = 'both' if pod_count == 2 else 'all'
+        else:
+            pod_label = ', '.join(sorted(pod_names.get(p, '?') for p in pod_ids))
+        rows.append({
+            'team_id': r['team_id'],
+            'team_name': r['name'],
+            'conference': r['conference_abbreviation'],
+            'margin': r['margin'],
+            'pod': pod_label,
+        })
+    rows.sort(key=lambda r: r['margin'], reverse=True)
+    return rows[:limit]
+
+
+def build_unplayed_games(
     season_id: int,
     week: int,
     player_ids: list[int],
@@ -276,49 +477,416 @@ def build_top_unplayed_winners(
     pod_of_player: dict[int, int],
     pod_names: dict[int, str],
     lineup_team_ids_by_player: dict[int, set[int]],
+    pods: list[dict],
+    conference_slot_tiers: dict[str, str],
     limit: int = 10,
+) -> dict:
+    """
+    The recap's "Unplayed Games" block: three league-wide top-`limit`
+    lists, each row tagged with the pod it applies to.
+
+      redundant -- owned, had a game, left on the bench, scored points,
+        but every lineup slot it was eligible for already held a team
+        scoring at least as much (measured against the owner's own
+        started teams, greedily re-arranged). Ranked by the team's own
+        margin.
+      wasted -- same population, but some eligible slot held a weaker
+        team; ranked by how many points swapping it in would have added
+        (this team's margin minus the team it would have replaced, or its
+        full margin against a slot the owner passed).
+      unowned -- highest-scoring teams with no roster owner, one row per
+        team; pod is a single name or 'both'.
+
+    A team benched by two owners in different pods produces two
+    redundant/wasted rows (the points-left value is owner-specific), but
+    only one unowned row.
+    """
+    capacities = _slot_capacities(conference_slot_tiers)
+    redundant: list[dict] = []
+    wasted: list[dict] = []
+
+    for pid in player_ids:
+        started = lineup_team_ids_by_player.get(pid, set())
+        roster_ids = [t['team_id'] for t in get_active_roster_teams(pid, season_id)]
+        bench_ids = [tid for tid in roster_ids if tid not in started]
+        if not bench_ids or not started:
+            continue
+
+        arranged = greedy_arrange_started_picks(
+            [TeamWeekResult(**r) for r in get_team_week_results(season_id, week, list(started))],
+            conference_slot_tiers,
+        )
+        tag = {
+            'player_id': pid,
+            'player_name': player_names.get(pid),
+            'pod_name': pod_names.get(pod_of_player.get(pid)),
+        }
+        for r in get_team_week_results(season_id, week, bench_ids):
+            team = TeamWeekResult(**r)
+            if team.margin is None:
+                continue
+            verdict = classify_bench_team(team, arranged, capacities, conference_slot_tiers)
+            if verdict is None:
+                continue
+            base = {
+                'team_id': team.team_id,
+                'team_name': team.name,
+                'conference': team.conference_abbreviation,
+                **tag,
+            }
+            if verdict['kind'] == 'wasted':
+                wasted.append({
+                    **base,
+                    'gain': verdict['gain'],
+                    'replaced_category': verdict['replaced_category'],
+                    'replaced_team': verdict['replaced_team'],
+                })
+            else:
+                redundant.append({**base, 'score': verdict['score']})
+
+    redundant.sort(key=lambda r: r['score'], reverse=True)
+    wasted.sort(key=lambda r: r['gain'], reverse=True)
+
+    return {
+        'redundant': redundant[:limit],
+        'wasted': wasted[:limit],
+        'unowned': _build_unowned_scores(season_id, week, pods, pod_names, limit),
+    }
+
+
+def _played_by_pod(
+    played_by_player: dict[int, set[int]],
+    pod_of_player: dict[int, int],
+) -> dict[int, dict[int, list[int]]]:
+    """{pod_id: {team_id: [player_id, ...]}} -- who in each pod started
+    each team this week. Players with no pod assignment are skipped."""
+    out: dict[int, dict[int, list[int]]] = {}
+    for pid, team_ids in played_by_player.items():
+        pod_id = pod_of_player.get(pid)
+        if pod_id is None:
+            continue
+        bucket = out.setdefault(pod_id, {})
+        for tid in team_ids:
+            bucket.setdefault(tid, []).append(pid)
+    return out
+
+
+def classify_pod_play(
+    played_by_pod: dict[int, dict[int, list[int]]],
+    owned_by_pod: dict[int, set[int]],
+    pod_a_id: int,
+    pod_b_id: int,
+) -> dict[str, list[dict]]:
+    """
+    Split every team started in either pod this week into five buckets
+    (a two-pod comparison). Each entry is
+    {'team_id', 'players_by_pod': {pod_id: [player_id, ...]}}, with
+    players_by_pod restricted to the pod(s) relevant to the bucket.
+
+      'both'              -- started in both pods
+      'owned_both_only_a' -- owned in both pods, started only in pod A
+      'owned_both_only_b' -- owned in both pods, started only in pod B
+      'only_a_unowned_b'  -- started in pod A, no active owner in pod B
+      'only_b_unowned_a'  -- started in pod B, no active owner in pod A
+
+    "started implies owned in the starting pod" is assumed; a team
+    dropped after it was started can make an 'owned in both' label
+    slightly generous -- acceptable for a retrospective snapshot.
+    """
+    a_played = played_by_pod.get(pod_a_id, {})
+    b_played = played_by_pod.get(pod_b_id, {})
+    b_owned = owned_by_pod.get(pod_b_id, set())
+    a_owned = owned_by_pod.get(pod_a_id, set())
+
+    buckets: dict[str, list[dict]] = {
+        k: [] for k in
+        ('both', 'owned_both_only_a', 'owned_both_only_b', 'only_a_unowned_b', 'only_b_unowned_a')
+    }
+    for tid in sorted(set(a_played) | set(b_played)):
+        in_a, in_b = tid in a_played, tid in b_played
+        if in_a and in_b:
+            buckets['both'].append({
+                'team_id': tid,
+                'players_by_pod': {pod_a_id: a_played[tid], pod_b_id: b_played[tid]},
+            })
+        elif in_a:
+            key = 'owned_both_only_a' if tid in b_owned else 'only_a_unowned_b'
+            buckets[key].append({'team_id': tid, 'players_by_pod': {pod_a_id: a_played[tid]}})
+        else:
+            key = 'owned_both_only_b' if tid in a_owned else 'only_b_unowned_a'
+            buckets[key].append({'team_id': tid, 'players_by_pod': {pod_b_id: b_played[tid]}})
+    return buckets
+
+
+def find_played_matchups(
+    played_by_pod: dict[int, dict[int, list[int]]],
+    team_games: dict[int, dict],
 ) -> list[dict]:
     """
-    League-wide (both pods): the highest-margin teams that were on some
-    player's roster but not included in that player's actual lineup this
-    week. A team owned by two different players in two different pods
-    (pods are fully severed) can legitimately appear twice here, once
-    per owner, if neither played it -- these are evaluated per
-    (player, team) ownership, not per team_id alone.
+    Real games this week where BOTH teams were started by some player
+    (either pod). One row per game_id:
+    {'game_id', 'team_id', 'opponent_id', 'margin' (team_id's side),
+     'players_by_pod', 'opp_players_by_pod'}. The caller decides how to
+    orient winner/loser for display.
     """
-    candidates = []
-    for pid in player_ids:
-        roster = get_active_roster_teams(pid, season_id)
-        roster_ids = [t['team_id'] for t in roster]
-        played = lineup_team_ids_by_player.get(pid, set())
-        unplayed_ids = [tid for tid in roster_ids if tid not in played]
-        if not unplayed_ids:
+    players_of: dict[int, dict[int, list[int]]] = {}
+    for pod_id, teams in played_by_pod.items():
+        for tid, pids in teams.items():
+            players_of.setdefault(tid, {})[pod_id] = pids
+
+    played = set(players_of)
+    seen: set[int] = set()
+    rows = []
+    for tid in sorted(played):
+        game = team_games.get(tid)
+        if not game or game['opponent_id'] not in played or game['game_id'] in seen:
             continue
-        results = get_team_week_results(season_id, week, unplayed_ids)
-        pod_id = pod_of_player.get(pid)
-        for r in results:
-            if r['margin'] is not None and r['margin'] > 0:
-                candidates.append({
-                    **r,
-                    'player_id': pid,
-                    'player_name': player_names.get(pid),
-                    'pod_name': pod_names.get(pod_id),
-                })
-
-    candidates.sort(key=lambda r: r['margin'], reverse=True)
-    return candidates[:limit]
+        seen.add(game['game_id'])
+        rows.append({
+            'game_id': game['game_id'],
+            'team_id': tid,
+            'opponent_id': game['opponent_id'],
+            'margin': game['margin'],
+            'players_by_pod': players_of[tid],
+            'opp_players_by_pod': players_of[game['opponent_id']],
+        })
+    return rows
 
 
-def build_top_free_agents(season_id: int, week: int, pod_id: int, limit: int = 10) -> list[dict]:
-    """Highest-margin free agents in this pod this week -- pod-scoped, since free agency is completely severed between pods."""
-    free_agents = get_available_teams(season_id, pod_id)
-    team_ids = [t['team_id'] for t in free_agents]
-    results = get_team_week_results(season_id, week, team_ids)
-    results = [r for r in results if r['margin'] is not None and r['margin'] > 0]
-    results.sort(key=lambda r: r['margin'], reverse=True)
-    return results[:limit]
+def build_pod_play_breakdown(
+    season_id: int,
+    week: int,
+    played_by_player: dict[int, set[int]],
+    pod_of_player: dict[int, int],
+    player_names: dict[int, str],
+    pods: list[dict],
+) -> Optional[dict]:
+    """
+    The recap's "Games by Pod & Ownership" block -- a two-pod comparison,
+    so None unless the season has exactly two pods. Every team started in
+    either pod this week, split by whether the other pod also started /
+    owns it (classify_pod_play), plus a head-to-head list of real games
+    where both teams were started (find_played_matchups). Every row
+    carries the starting player(s), grouped by pod name.
+    """
+    if len(pods) != 2:
+        return None
+
+    pod_a, pod_b = pods[0], pods[1]
+    pod_name = {p['id']: p['name'] for p in pods}
+
+    played_by_pod = _played_by_pod(played_by_player, pod_of_player)
+    all_team_ids = sorted({tid for teams in played_by_pod.values() for tid in teams})
+    if not all_team_ids:
+        return None
+
+    meta = {r['team_id']: r for r in get_team_week_results(season_id, week, all_team_ids)}
+    team_games = get_week_team_games(season_id, week, all_team_ids)
+    owned_by_pod = {p['id']: get_owned_team_ids(season_id, p['id']) for p in pods}
+
+    def names(players_by_pod: dict[int, list[int]]) -> list[dict]:
+        return [
+            {'podName': pod_name[pod_id], 'playerName': player_names.get(pid)}
+            for pod_id, pids in players_by_pod.items()
+            for pid in pids
+        ]
+
+    def team_row(entry: dict) -> dict:
+        m = meta.get(entry['team_id'], {})
+        return {
+            'teamName': m.get('name'),
+            'conference': m.get('conference_abbreviation'),
+            'margin': m.get('margin'),
+            'players': names(entry['players_by_pod']),
+        }
+
+    buckets = classify_pod_play(played_by_pod, owned_by_pod, pod_a['id'], pod_b['id'])
+    a_name, b_name = pod_a['name'], pod_b['name']
+    categories = [
+        {'label': 'Started in both pods', 'rows': [team_row(e) for e in buckets['both']]},
+        {'label': f'Owned in both pods, started only in {a_name}',
+         'rows': [team_row(e) for e in buckets['owned_both_only_a']]},
+        {'label': f'Owned in both pods, started only in {b_name}',
+         'rows': [team_row(e) for e in buckets['owned_both_only_b']]},
+        {'label': f'Started in {a_name}, not owned in {b_name}',
+         'rows': [team_row(e) for e in buckets['only_a_unowned_b']]},
+        {'label': f'Started in {b_name}, not owned in {a_name}',
+         'rows': [team_row(e) for e in buckets['only_b_unowned_a']]},
+    ]
+    for category in categories:
+        category['rows'].sort(
+            key=lambda r: (r['margin'] is None, -(r['margin'] or 0), r['teamName'] or '')
+        )
+
+    matchups = []
+    for mm in find_played_matchups(played_by_pod, team_games):
+        tid, opp, margin = mm['team_id'], mm['opponent_id'], mm['margin']
+        t_players, o_players = mm['players_by_pod'], mm['opp_players_by_pod']
+        if margin is not None and margin < 0:                # orient winner first
+            tid, opp, margin = opp, tid, -margin
+            t_players, o_players = o_players, t_players
+        t_meta, o_meta = meta.get(tid, {}), meta.get(opp, {})
+        matchups.append({
+            'gameId': mm['game_id'],
+            'teamName': t_meta.get('name'),
+            'teamConference': t_meta.get('conference_abbreviation'),
+            'teamMargin': margin,
+            'teamPlayers': names(t_players),
+            'oppName': o_meta.get('name'),
+            'oppConference': o_meta.get('conference_abbreviation'),
+            'oppPlayers': names(o_players),
+        })
+    matchups.sort(key=lambda r: (r['teamMargin'] is None, -(r['teamMargin'] or 0), r['teamName'] or ''))
+
+    return {'categories': categories, 'matchups': matchups}
 
 
 def build_scrappy_by_pod(season_id: int, week: int, pods: list[dict]) -> dict[str, OptimalLineupResult]:
     """{pod_name: OptimalLineupResult} for every pod this season."""
     return {pod['name']: compute_scrappy_optimal(season_id, week, pod['id']) for pod in pods}
+
+
+# ------------------------------------------------------------------
+# Pick Similarity -- how alike were two players' picks this week
+# ------------------------------------------------------------------
+
+# The flex / wild-card slot types have no per-slot identity to pair on
+# (a player's three P4-flex slots are interchangeable), so they bucket
+# by type; conference slots bucket by their conference abbreviation.
+_FLEX_SLOT_KEYS = {'p4_flex': 'P4 Flex', 'g6_flex': 'G6 Flex', 'wildcard': 'Wild Card'}
+
+
+def _sign(n: int) -> int:
+    return (n > 0) - (n < 0)
+
+
+def compare_players_by_teams(
+    lineup_team_ids_by_player: dict[int, set[int]],
+    team_margin: dict[int, Optional[int]],
+    team_meta: dict[int, dict],
+    player_names: dict[int, str],
+    pod_of_player: dict[int, int],
+    pod_names: dict[int, str],
+) -> list[dict]:
+    """
+    Cross-pod player pairs compared by the teams they picked this week,
+    ignoring which slot each team filled. Same-pod players can never
+    share a team (pods are severed rosters), so only cross-pod pairs are
+    compared -- the result is [] for a single-pod season.
+
+    Two independent similarity measures per pair (Zach, 2026-09):
+      matchingTeams  -- plain count of teams both players picked (0-16).
+      sharedImpact   -- sum of |margin| over those shared teams. A team
+                        that lost by 20 counts the same as one that won
+                        by 20: either way, that game moved both players'
+                        weeks by the same amount, so it's a shared swing.
+    sharedTeams lists the shared teams (name, conference, signed margin),
+    ordered by |margin| desc. Rows come back sorted by matchingTeams
+    desc then sharedImpact desc; the renderer re-sorts for its second
+    table. A shared team whose game has no score yet (margin None) counts
+    as 0 impact but still counts toward matchingTeams.
+    """
+    pods_present = {pod_of_player.get(pid) for pid in lineup_team_ids_by_player}
+    pods_present.discard(None)
+    if len(pods_present) < 2:
+        return []
+
+    def impact(tid: int) -> int:
+        v = team_margin.get(tid)
+        return abs(v) if v is not None else 0
+
+    rows = []
+    pids = sorted(lineup_team_ids_by_player)
+    for idx, a in enumerate(pids):
+        for b in pids[idx + 1:]:
+            pod_a, pod_b = pod_of_player.get(a), pod_of_player.get(b)
+            if pod_a is None or pod_b is None or pod_a == pod_b:
+                continue
+            shared = lineup_team_ids_by_player[a] & lineup_team_ids_by_player[b]
+            shared_teams = sorted(
+                (
+                    {
+                        'teamId': tid,
+                        'teamName': team_meta.get(tid, {}).get('name'),
+                        'conference': team_meta.get(tid, {}).get('conference'),
+                        'margin': team_margin.get(tid),
+                    }
+                    for tid in shared
+                ),
+                key=lambda r: abs(r['margin']) if r['margin'] is not None else 0,
+                reverse=True,
+            )
+            rows.append({
+                'aPlayerId': a, 'aName': player_names.get(a), 'aPodName': pod_names.get(pod_a),
+                'bPlayerId': b, 'bName': player_names.get(b), 'bPodName': pod_names.get(pod_b),
+                'matchingTeams': len(shared),
+                'sharedImpact': sum(impact(tid) for tid in shared),
+                'sharedTeams': shared_teams,
+            })
+    rows.sort(key=lambda r: (r['matchingTeams'], r['sharedImpact']), reverse=True)
+    return rows
+
+
+def _slot_margins_by_key(slots: list[dict]) -> dict[str, list[int]]:
+    """
+    {slot_key: [margin, ...]} for one player's slots. A conference slot's
+    key is its conference abbreviation (its `label`); the flex / wild-card
+    slots bucket by type. Byes and passes count as 0, matching
+    compute_player_totals().
+    """
+    out: dict[str, list[int]] = {}
+    for s in slots:
+        slot_type = s['slot_type']
+        key = s['label'] if slot_type == 'conference' else _FLEX_SLOT_KEYS.get(slot_type, slot_type)
+        out.setdefault(key, []).append(s['margin'] or 0)
+    return out
+
+
+def compare_players_by_slot_points(
+    slots_by_player: dict[int, list[dict]],
+    player_names: dict[int, str],
+    pod_of_player: dict[int, int],
+    pod_names: dict[int, str],
+) -> list[dict]:
+    """
+    Every player pair (both pods), compared slot for slot on the points
+    each slot produced -- not on team identity. A team in a player's SEC
+    slot is only ever compared against the other player's SEC slot, never
+    against the same team sitting in their flex (Zach, 2026-09). The
+    three P4-flex slots (and the two G6-flex slots) have no natural
+    identity, so within each of those buckets both players' picks are
+    ranked by margin and compared rank-for-rank -- best flex vs best flex.
+
+    Per slot the distance is |marginA - marginB|; summed over every slot
+    that gives slotPointDistance (lower = more alike). Sign agreement is
+    tracked separately as sameDirectionSlots: slots where both picks won,
+    both lost, or both landed on exactly zero -- so "we both ate a
+    blowout in the same spot" reads as similar, not just "we both scored".
+    Rows come back sorted by slotPointDistance asc, then
+    sameDirectionSlots desc.
+    """
+    rows = []
+    pids = sorted(slots_by_player)
+    for idx, a in enumerate(pids):
+        for b in pids[idx + 1:]:
+            a_keys = _slot_margins_by_key(slots_by_player[a])
+            b_keys = _slot_margins_by_key(slots_by_player[b])
+            distance = same_dir = compared = 0
+            for key in set(a_keys) | set(b_keys):
+                a_list = sorted(a_keys.get(key, []), reverse=True)
+                b_list = sorted(b_keys.get(key, []), reverse=True)
+                for margin_a, margin_b in zip(a_list, b_list):
+                    distance += abs(margin_a - margin_b)
+                    if _sign(margin_a) == _sign(margin_b):
+                        same_dir += 1
+                    compared += 1
+            pod_a, pod_b = pod_of_player.get(a), pod_of_player.get(b)
+            rows.append({
+                'aPlayerId': a, 'aName': player_names.get(a), 'aPodName': pod_names.get(pod_a),
+                'bPlayerId': b, 'bName': player_names.get(b), 'bPodName': pod_names.get(pod_b),
+                'slotPointDistance': distance,
+                'sameDirectionSlots': same_dir,
+                'slotsCompared': compared,
+            })
+    rows.sort(key=lambda r: (r['slotPointDistance'], -r['sameDirectionSlots']))
+    return rows

@@ -143,17 +143,24 @@ You should now have a season ready for Week 1 lineups.
 
 1. **Game day — start live scoring:**
    ```bash
-   python scripts/scoring_engine.py --season 8 --week 1
+   python scripts/scoring_engine.py --week 1
    ```
+   `--season` defaults to `lib.config.CURRENT_SEASON_ID` (the live
+   season); pass `--season <id>` explicitly to target a different one.
    Polls the CFBD scoreboard every 5 minutes (`--interval` to change
-   it), scores every submitted lineup, writes a local JSON checkpoint,
-   updates the score plot, and pushes the live status page to
-   WordPress. Leave it running through the day's games, or re-run
-   periodically — either works, it's idempotent per checkpoint.
+   it) while games are live, scores every submitted lineup, writes a
+   local JSON checkpoint, updates the score plot, and pushes the live
+   status page to WordPress. When no tracked game is in progress it
+   sleeps until shortly before the next remaining game's kickoff
+   instead of polling every 5 minutes — safe to start once and leave
+   running across the whole week's slate (e.g. a couple Thursday/Friday
+   games, a big Saturday slate, then a few on Sunday/Monday); it goes
+   quiet overnight on its own. Re-running it periodically instead also
+   still works — it's idempotent per checkpoint.
 
 2. **Once every game is final — finalize the week:**
    ```bash
-   python scripts/scoring_engine.py --season 8 --week 1 --finalize-only
+   python scripts/scoring_engine.py --week 1 --finalize-only
    ```
    Pulls final scores from CFBD, writes `weekly_results`, resolves
    this week's PVP matchups, backfills the `games` table, detects new
