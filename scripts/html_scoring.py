@@ -29,8 +29,10 @@ Pass an empty dict when no live/final data is available yet (all-pending).
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1212,7 +1214,8 @@ _STATUS_PAGE_TEMPLATE = """<!-- wp:html -->
 
 <script>
 (function () {
-  var DATA = __CFB_STATUS_DATA__;
+  var DATA = JSON.parse(new TextDecoder().decode(
+    Uint8Array.from(atob('__CFB_STATUS_DATA_B64__'), function (c) { return c.charCodeAt(0); })));
   var ESPN_URL = 'https://www.espn.com/college-football/game/_/gameId/';
   var root = document.getElementById('cfb-status');
 
@@ -1453,11 +1456,50 @@ _STATUS_PAGE_TEMPLATE = """<!-- wp:html -->
 <!-- /wp:html -->"""
 
 
+_INLINE_BLOCK_RE = re.compile(r'<script>\n(.*)\n</script>\n<!-- /wp:html -->', re.S)
+
+
+def _shield_inline_script(html: str, code_id: str) -> str:
+    """
+    Ship the entire inline renderer as a base64 blob the page decodes at
+    runtime, not as live JS in the post body.
+
+    WordPress runs its content filters over a pushed post and
+    entity-encodes every bare `&` -- the renderer's `&&` operators become
+    `&#038;&#038;`, a SyntaxError that blanks the whole page. It leaves
+    `<`, `>` and existing `&entity;` sequences alone, so only `&` is the
+    problem, but `&&` is unavoidable in the JS. `<!-- wp:html -->` alone
+    doesn't stop the filter on this install.
+
+    Fix: the renderer goes into a NON-executing <script type="text/plain">
+    as base64 ([A-Za-z0-9+/=], nothing WP rewrites), and a tiny bootstrap
+    -- which contains no `&`, `<` or `>` for WP to touch -- decodes it
+    into a fresh <script> element. No `eval`; runs under a plain
+    `unsafe-inline` CSP. The base64 payload (`var DATA = ...`) is nested
+    inside this blob and rides along for free.
+    """
+    m = _INLINE_BLOCK_RE.search(html)
+    if m is None:
+        return html  # template shape changed -- don't risk corrupting it
+    js_b64 = base64.b64encode(m.group(1).encode('utf-8')).decode('ascii')
+    boot = (
+        f'<script type="text/plain" id="{code_id}">{js_b64}</script>\n'
+        '<script>(function(){'
+        'var s=document.createElement("script");'
+        f's.textContent=atob(document.getElementById("{code_id}").textContent);'
+        'document.body.appendChild(s);'
+        '})();</script>\n<!-- /wp:html -->'
+    )
+    return html[:m.start()] + boot + html[m.end():]
+
+
 def _render_status_page(payload: dict) -> str:
-    """Inject the JSON payload into _STATUS_PAGE_TEMPLATE. `</` is escaped
-    so a team/player name can never prematurely close the <script> tag."""
-    data_json = json.dumps(payload).replace('</', '<\\/')
-    return _STATUS_PAGE_TEMPLATE.replace('__CFB_STATUS_DATA__', data_json)
+    """Inject the JSON payload into _STATUS_PAGE_TEMPLATE as a base64 blob,
+    then shield the whole inline renderer from WordPress's content filters
+    (see _shield_inline_script)."""
+    data_b64 = base64.b64encode(json.dumps(payload).encode('utf-8')).decode('ascii')
+    html = _STATUS_PAGE_TEMPLATE.replace('__CFB_STATUS_DATA_B64__', data_b64)
+    return _shield_inline_script(html, 'cfb-status-code')
 
 
 # ------------------------------------------------------------------
@@ -1678,6 +1720,20 @@ _RECAP_PAGE_TEMPLATE = """<!-- wp:html -->
       </div>
     </div>
 
+    <p class="cfb-section-label">Player Detail</p>
+    <div class="cfb-toolbar">
+      <select id="cfb-pod-filter" aria-label="Filter by pod"><option value="all">All pods</option></select>
+      <select id="cfb-sort-by" aria-label="Sort players">
+        <option value="week">Sort: Week net (high&rarr;low)</option>
+        <option value="name">Sort: Name (A&rarr;Z)</option>
+      </select>
+      <input type="search" id="cfb-search" placeholder="Find a player&hellip;" aria-label="Search players">
+      <div class="cfb-toolbar-spacer"></div>
+      <button class="cfb-tbtn" id="cfb-expand-all">Expand all</button>
+      <button class="cfb-tbtn" id="cfb-collapse-all">Collapse all</button>
+    </div>
+    <div class="cfb-roster" id="cfb-roster"></div>
+
     <p class="cfb-section-label">Max &mdash; Best Possible Lineup, Any FBS Team</p>
     <div id="cfb-max-lineup"></div>
 
@@ -1746,26 +1802,13 @@ _RECAP_PAGE_TEMPLATE = """<!-- wp:html -->
         </table>
       </div>
     </div>
-
-    <p class="cfb-section-label">Player Detail</p>
-    <div class="cfb-toolbar">
-      <select id="cfb-pod-filter" aria-label="Filter by pod"><option value="all">All pods</option></select>
-      <select id="cfb-sort-by" aria-label="Sort players">
-        <option value="week">Sort: Week net (high&rarr;low)</option>
-        <option value="name">Sort: Name (A&rarr;Z)</option>
-      </select>
-      <input type="search" id="cfb-search" placeholder="Find a player&hellip;" aria-label="Search players">
-      <div class="cfb-toolbar-spacer"></div>
-      <button class="cfb-tbtn" id="cfb-expand-all">Expand all</button>
-      <button class="cfb-tbtn" id="cfb-collapse-all">Collapse all</button>
-    </div>
-    <div class="cfb-roster" id="cfb-roster"></div>
   </div>
 </div>
 
 <script>
 (function () {
-  var DATA = __CFB_RECAP_DATA__;
+  var DATA = JSON.parse(new TextDecoder().decode(
+    Uint8Array.from(atob('__CFB_RECAP_DATA_B64__'), function (c) { return c.charCodeAt(0); })));
 
   function fmtSigned(n) { return (n > 0 ? '+' : '') + n; }
   function isOrange(podName) { return /orange/i.test(podName || ''); }
@@ -2190,20 +2233,24 @@ _RECAP_PAGE_TEMPLATE = """<!-- wp:html -->
 
 def _render_recap_page(payload: dict) -> str:
     """
-    Inject the JSON payload (and the default empty summary block) into
-    _RECAP_PAGE_TEMPLATE. Two separate placeholders, replaced in this
-    order (data first): __CFB_RECAP_DATA__ is real JSON and could in
-    principle contain the literal substring "__CFB_SUMMARY_BLOCK__" if
-    a team/player name were ever that perverse, so the summary
-    placeholder -- which is not attacker-controlled, always exactly
-    _DEFAULT_SUMMARY_BLOCK at this stage -- is substituted second to
-    avoid that (admittedly unlikely) collision. `</` is escaped in the
-    JSON so a name can never prematurely close the <script> tag.
+    Inject the base64-encoded JSON payload and the default empty summary
+    block into _RECAP_PAGE_TEMPLATE.
+
+    The payload rides as a base64 blob the page decodes at runtime rather
+    than a literal `var DATA = {...}` assignment: WordPress runs its
+    content filters over the post body and entity-encodes a bare `&` (a
+    "Texas A&M" team name becomes `&amp;` / `&#038;`), smart-quotes `"`,
+    and turns `--` into an en dash -- any of which makes the inline JS a
+    SyntaxError and leaves the page a bare outline. A base64 string is
+    [A-Za-z0-9+/=] only, so nothing in it survives as something WP wants
+    to rewrite -- and `_` isn't in that alphabet, so the blob also can't
+    collide with the `__CFB_SUMMARY_BLOCK__` placeholder (the old
+    raw-JSON version's ordering worry). Data-first is kept anyway.
     """
-    data_json = json.dumps(payload).replace('</', '<\\/')
-    html = _RECAP_PAGE_TEMPLATE.replace('__CFB_RECAP_DATA__', data_json)
+    data_b64 = base64.b64encode(json.dumps(payload).encode('utf-8')).decode('ascii')
+    html = _RECAP_PAGE_TEMPLATE.replace('__CFB_RECAP_DATA_B64__', data_b64)
     html = html.replace('__CFB_SUMMARY_BLOCK__', _DEFAULT_SUMMARY_BLOCK)
-    return html
+    return _shield_inline_script(html, 'cfb-recap-code')
 
 
 def render_recap_fragment(
