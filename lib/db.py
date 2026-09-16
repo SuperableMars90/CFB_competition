@@ -584,17 +584,22 @@ def create_dropadd_request(
     week: int,
     dropped_team_id: Optional[int],
     added_team_id: Optional[int],
+    notes: Optional[str] = None,
 ) -> int:
-    """Insert a pending drop/add request; returns dropadd_requests.id."""
+    """Insert a pending drop/add request; returns dropadd_requests.id.
+
+    notes is the player's optional message to the commissioner (blank text
+    is normalized to NULL rather than stored as an empty string).
+    """
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute(
             """
             INSERT INTO dropadd_requests
-                (player_id, season_id, week, dropped_team_id, added_team_id, status)
-            VALUES (%s, %s, %s, %s, %s, 'pending')
+                (player_id, season_id, week, dropped_team_id, added_team_id, status, notes)
+            VALUES (%s, %s, %s, %s, %s, 'pending', %s)
             """,
-            (player_id, season_id, week, dropped_team_id, added_team_id),
+            (player_id, season_id, week, dropped_team_id, added_team_id, notes or None),
         )
         request_id = cur.lastrowid
         conn.commit()
@@ -788,6 +793,71 @@ def get_week0_elections(player_id: int, season_id: int) -> list[dict]:
         rows = cur.fetchall()
         cur.close()
     return rows
+
+
+@st.cache_data(ttl=300)
+def get_week0_election_context(player_id: int, season_id: int) -> list[TeamGameContext]:
+    """
+    TeamGameContext for every team behind an *undeployed* week 0 election of
+    this player's (same filter as get_week0_elections: week_deployed IS NULL
+    AND declared != 1), regardless of whether that team is still on their
+    active roster.
+
+    A banked week 0 game was locked in before any later drop, so a drop must
+    not orphan it -- get_roster_with_context alone won't surface a dropped
+    team, which is why this exists as a separate lookup (see submit_lineup.py,
+    which merges the two so the team stays selectable for its banked game
+    only, never for a live current-week pick).
+
+    game_id / opponent_team_id / opponent_name / location describe the banked
+    week 0 game itself, not whatever the team is doing in the current week.
+    """
+    query = """
+        SELECT
+            t.id                  AS team_id,
+            t.name_display        AS name,
+            t.conference_id       AS conference_id,
+            c.abbreviation        AS conference_abbreviation,
+            c.tier                AS tier,
+            g.id                  AS game_id,
+            CASE WHEN g.home_team_id = t.id THEN g.away_team_id
+                 ELSE g.home_team_id END AS opponent_team_id,
+            CASE WHEN g.home_team_id = t.id THEN at.name_display
+                 ELSE ht.name_display END AS opponent_name,
+            CASE WHEN g.is_neutral THEN 'neutral'
+                 WHEN g.home_team_id = t.id THEN 'home'
+                 ELSE 'away' END AS location
+        FROM week0_elections we
+        JOIN teams t         ON t.id = we.team_id
+        JOIN conferences c   ON c.id = t.conference_id
+        JOIN games g         ON g.id = we.game_id
+        JOIN teams ht        ON ht.id = g.home_team_id
+        JOIN teams at        ON at.id = g.away_team_id
+        WHERE we.player_id = %s
+          AND we.season_id = %s
+          AND we.week_deployed IS NULL
+          AND we.declared != 1
+    """
+    with get_connection() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(query, (player_id, season_id))
+        rows = cur.fetchall()
+        cur.close()
+
+    return [
+        TeamGameContext(
+            team_id=row["team_id"],
+            name=row["name"],
+            conference_id=row["conference_id"],
+            conference_abbreviation=row["conference_abbreviation"],
+            tier=row["tier"],
+            game_id=row["game_id"],
+            opponent_team_id=row["opponent_team_id"],
+            opponent_name=row["opponent_name"],
+            location=GameLocation(row["location"]),
+        )
+        for row in rows
+    ]
 
 
 @st.cache_data(ttl=3600)
@@ -1143,6 +1213,7 @@ def save_lineup(player_id: int, season_id: int, week: int, picks: list[Pick]) ->
             get_lineup.clear(player_id, season_id, week)
             if week0_game_ids:
                 get_week0_elections.clear(player_id, season_id)
+                get_week0_election_context.clear(player_id, season_id)
 
             return lineup_id
         finally:

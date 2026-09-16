@@ -10,6 +10,10 @@ Eligibility per dropdown is computed by running each roster team through
 game_rules.validate_pick for that slot, so the rules live in exactly one
 place. Duplicate-team across slots is intentionally NOT filtered live (it
 makes dropdowns jump on rerun); it's caught by validate_lineup at review.
+
+A team dropped after banking a week 0 election stays selectable for that
+banked game alone (never for a live pick) -- see dropped_election_teams
+below, backed by lib.db.get_week0_election_context.
 """
 
 from datetime import timezone
@@ -22,6 +26,7 @@ from lib.db import (
     get_roster_with_context,
     get_conference_slot_tiers,
     get_week0_elections,
+    get_week0_election_context,
     get_week0_cutoff_week,
     get_week_date_ranges,
     format_week_label,
@@ -106,6 +111,21 @@ week0_by_team: dict[int, list[int]] = {}
 for e in elections:
     week0_by_team.setdefault(e["team_id"], []).append(e["game_id"])
 
+# A banked week 0 election was locked in before any later drop, so dropping
+# the team must not orphan it: give it a synthetic context so it stays
+# selectable for its banked game(s), even though get_roster_with_context
+# (active roster only) won't return it. Only teams NOT already on the
+# current roster need this -- an active team's banked game is already
+# handled by week0_by_team above.
+dropped_election_teams = [
+    ctx for ctx in (get_week0_election_context(player_id, season_id) if elections else [])
+    if ctx.team_id not in roster_by_id
+]
+dropped_election_ids = {ctx.team_id for ctx in dropped_election_teams}
+for ctx in dropped_election_teams:
+    roster_by_id[ctx.team_id] = ctx
+roster_ids |= dropped_election_ids
+
 if elections and cutoff_week:
     if week >= cutoff_week:
         st.error(
@@ -138,15 +158,25 @@ def eligible_options(slot_type, identifier):
     """
     Return (team_id, game_id) tuples eligible for this slot.
 
-    For each eligible roster team, the current-week game is included as
-    (team_id, team.game_id). If the player also has an undeployed week 0
+    For each eligible active-roster team, the current-week game is included
+    as (team_id, team.game_id). If the player also has an undeployed week 0
     election for that team, each banked game_id is appended immediately after.
+
+    A team the player has since dropped is never offered for a live pick,
+    but if it still carries an undeployed week 0 election, that banked
+    game alone is offered (dropped_election_teams above) -- the drop cost
+    the roster spot, not the game already banked.
     """
     out = []
     for team in roster:
         pick = Pick(slot_type, identifier, team)
         if validate_pick(pick, roster_ids, slot_tiers).is_valid:
             out.append((team.team_id, team.game_id))
+            for w0_gid in week0_by_team.get(team.team_id, []):
+                out.append((team.team_id, w0_gid))
+    for team in dropped_election_teams:
+        pick = Pick(slot_type, identifier, team)
+        if validate_pick(pick, roster_ids, slot_tiers).is_valid:
             for w0_gid in week0_by_team.get(team.team_id, []):
                 out.append((team.team_id, w0_gid))
     return out
@@ -196,6 +226,8 @@ def render_slot(slot_type, identifier, label):
         team_id, game_id = value
         team = roster_by_id[team_id]
         if game_id in week0_game_ids:
+            if team_id in dropped_election_ids:
+                return f"{team.name} (week 0, dropped since)"
             return f"{team.name} (week 0)"
         return team.display_label
 

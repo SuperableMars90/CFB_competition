@@ -669,13 +669,18 @@ def _render_fragment_body(week: int, timestamp: str, summaries: list[dict]) -> s
 SUMMARY_MARKER_START = '<!-- SUMMARY:START -->'
 SUMMARY_MARKER_END = '<!-- SUMMARY:END -->'
 
+# Plain HTML only -- NO `<!-- wp:... -->` block delimiters here. This block
+# is injected inside the recap's single `<!-- wp:html -->` (Custom HTML)
+# block; a nested `wp:heading`/`wp:paragraph` delimiter makes WordPress's
+# block parser treat it as a real child block, which orphans everything
+# before it (the `<style>` element, the opening `<div>`s) into a classic/
+# freeform chunk. `wpautop` then runs over that chunk and rewrites the CSS
+# -- `<br />` after every line, `<p>`/`</p>` at every blank line -- leaving
+# the whole recap unstyled. The plain `<!-- SUMMARY:START/END -->` HTML
+# comments are fine: WordPress leaves non-`wp:`-prefixed comments alone.
 _DEFAULT_SUMMARY_BLOCK = f"""{SUMMARY_MARKER_START}
-<!-- wp:heading {{"level":2}} -->
 <h2>Commissioner's Notes</h2>
-<!-- /wp:heading -->
-<!-- wp:paragraph -->
 <p></p>
-<!-- /wp:paragraph -->
 {SUMMARY_MARKER_END}"""
 
 
@@ -691,6 +696,13 @@ def merge_recap_summary(existing_content: Optional[str], new_content: str) -> st
     --finalize-only re-push. existing_content=None (first-ever push for
     this week) or a missing marker both fall through to the fresh
     (empty) block untouched.
+
+    Any `<!-- wp:... -->` / `<!-- /wp:... -->` block delimiters WordPress
+    wrapped around the notes (it does this to anything typed in the block
+    editor) are stripped from the preserved text before it goes back in:
+    left in place, a nested delimiter inside the recap's `<!-- wp:html -->`
+    block breaks the Custom HTML block and `wpautop` shreds the page's
+    inline `<style>` -- see the note on _DEFAULT_SUMMARY_BLOCK.
     """
     if not existing_content:
         return new_content
@@ -698,6 +710,7 @@ def merge_recap_summary(existing_content: Optional[str], new_content: str) -> st
         return new_content
 
     preserved = existing_content.split(SUMMARY_MARKER_START, 1)[1].split(SUMMARY_MARKER_END, 1)[0]
+    preserved = re.sub(r'<!--\s*/?wp:[^>]*-->', '', preserved)
     preserved_block = f"{SUMMARY_MARKER_START}{preserved}{SUMMARY_MARKER_END}"
 
     before, rest = new_content.split(SUMMARY_MARKER_START, 1)

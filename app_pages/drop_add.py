@@ -31,18 +31,24 @@ NONE_LABEL = "— None —"
 
 st.title("Drop / Add")
 
-# T25: informational only — separate from the week input below.
+# The request is always recorded against the current week — there's no
+# reason for the player to pick one; a request takes effect (on approval)
+# immediately regardless of what week is stored, and week is kept purely as
+# the audit-trail label on dropadd_requests / drop_add_log (useful after the
+# fact for "which week did this team get dropped"). Removed the old
+# free-entry "Week" number input (a DEV SEAM) that let a player record any
+# week 1-20 regardless of when they actually asked.
 _current_week = get_current_week(CURRENT_SEASON_ID)
 if _current_week is not None:
     st.caption(f"Current week: {_current_week}")
 
+if st.session_state.pop("dropadd_just_submitted", False):
+    st.success("Your drop/add request was submitted — waiting on commissioner approval.")
 
-# --- Auth + week picker -------------------------------------------------
+
+# --- Auth ------------------------------------------------------------------
 player = get_logged_in_player()
 player_id = player["id"]
-
-week = st.number_input("Week", min_value=1, max_value=20, value=1, step=1)  # DEV SEAM
-week = int(week)
 
 season_id = CURRENT_SEASON_ID
 
@@ -55,7 +61,9 @@ st.subheader("Request a drop/add")
 
 roster = get_active_roster_teams(player_id, season_id)
 
-if not roster:
+if _current_week is None:
+    st.info("No current week could be determined for this season, so requests can't be recorded — contact the commissioner.")
+elif not roster:
     st.info("You have no active roster for the current season — nothing to drop/add.")
 else:
     available = get_available_teams(season_id, player["pod_id"])
@@ -102,11 +110,16 @@ else:
             create_dropadd_request(
                 player_id=player_id,
                 season_id=season_id,
-                week=week,
+                week=_current_week,
                 dropped_team_id=drop_choice,
                 added_team_id=add_choice,
+                notes=notes.strip() if notes else None,
             )
-            st.success("Request submitted — waiting on commissioner approval.")
+            # st.rerun() below restarts the script immediately, so a
+            # st.success() called here would only flash for an instant.
+            # Stash it in session_state and render it near the top of the
+            # next run instead, where it actually stays visible.
+            st.session_state["dropadd_just_submitted"] = True
             st.rerun()
 
 
