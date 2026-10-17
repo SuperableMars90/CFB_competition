@@ -113,9 +113,25 @@ class CFBDClient:
             'seasonType': season_type,
         })
 
-    def get_scoreboard(self):
+    def get_scoreboard(self, classification=None):
         """
         Live in-progress scores for the current week.
         No year parameter — always returns current live data.
+        classification: None (CFBD default, 'fbs'), 'fcs', etc. The 'fcs'
+        scoreboard is keyed on the home team's division, so it also
+        repeats FBS-home-vs-FCS games the default call already returns.
         """
-        return self._get('/scoreboard')
+        params = {'classification': classification} if classification else None
+        return self._get('/scoreboard', params=params)
+
+    def get_lines(self, year, week, season_type='regular'):
+        """
+        Betting lines for a week, one entry per game with a `lines` list
+        (one dict per provider, `spread` home-relative: negative = home
+        favored). Covers FCS-vs-FCS games as well as FBS ones.
+        """
+        return self._get('/lines', params={
+            'year': year,
+            'week': week,
+            'seasonType': season_type,
+        })

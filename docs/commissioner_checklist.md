@@ -168,6 +168,11 @@ You should now have a season ready for Week 1 lineups.
    WordPress. Also safe to re-run as a correction (e.g. a stat
    correction from CFBD after the fact) — it's built to be idempotent.
 
+   **Commissioner's Notes:** write them as `scratch/week_N_commissioner_notes.md`
+   and import with `python scripts/import_commissioner_notes.py <file>`
+   (`--check` to validate, `--push` to update the live post). Format and
+   caveats in `docs/commissioner_notes_format.md`.
+
 3. **Drop/add requests** — reviewed entirely in-app
    (`app_pages/drop_add.py`, approve/deny). Approving one auto-pushes
    the updated rosters page to WordPress; no separate script needed.

@@ -21,9 +21,12 @@ Usage:
                    title='2026 Week 1 Status', content='<p>...</p>')
 """
 
+import mimetypes
 import os
 import sys
 import tomllib
+from pathlib import Path
+
 import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -96,6 +99,21 @@ class WordPressClient:
         if existing is None:
             return self.create(post_type, title, slug, content, status=status)
         return self.update(post_type, existing['id'], content, title=title, status=status)
+
+    def upload_media(self, path):
+        """
+        Upload an image file to the WordPress media library and return its
+        public URL. Always creates a new media item (WordPress renames a
+        duplicate filename rather than replacing it), so callers shouldn't
+        loop this on every re-push of an unchanged image.
+        """
+        path = Path(path)
+        mime = mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
+        item = self._request('POST', 'media', data=path.read_bytes(), headers={
+            'Content-Disposition': f'attachment; filename="{path.name}"',
+            'Content-Type': mime,
+        })
+        return item['source_url']
 
     def delete(self, post_type, post_id, force=False):
         """Delete a post/page (moves to trash unless force=True)."""

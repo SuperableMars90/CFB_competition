@@ -64,7 +64,8 @@ import matplotlib.dates as mdates
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from lib.config import CURRENT_SEASON_ID
-from lib.db import get_connection, update_game_results, get_pod_membership_map
+from lib.db import get_connection, update_game_results, get_pod_membership_map, upsert_game_lines
+from lib.projection import average_spread, game_started
 from lib.scoring import (
     load_week_picks,
     score_picks,
@@ -150,25 +151,8 @@ def initialize_week(season_id: int, week: int) -> dict:
 # Scoreboard fetch
 # ------------------------------------------------------------------
 
-def fetch_live_scores(client: CFBDClient) -> dict[int, dict]:
-    """
-    Call the CFBD scoreboard endpoint and return a dict keyed by cfbd_game_id.
-
-    Each value: {status, home_points, away_points, home_id, away_id, period, clock,
-    start_date}. status is normalized to 'scheduled' / 'in_progress' / 'final'.
-
-    CFBD's /scoreboard GameStatus enum (per docs/cfbd-openapi.json) is actually
-    {scheduled, in_progress, completed} — it never returns 'final'. Every other
-    consumer in this codebase (_game_counts, _status_display, update_game_results,
-    the live status page's JS) was written expecting 'final', matching the
-    convention _fetch_final_scores() already normalizes to from the /games
-    endpoint's separate boolean `completed` field. Left unnormalized here, a
-    finished game's slot silently reverts to showing as "pending"/"not started"
-    the moment CFBD flips it from in_progress to completed, since nothing
-    downstream recognizes 'completed' as done. start_date is CFBD's raw ISO 8601
-    kickoff timestamp string (or None).
-    """
-    raw = client.get_scoreboard()
+def _normalize_scoreboard(raw: list[dict], division: str) -> dict[int, dict]:
+    """One CFBD /scoreboard response -> {cfbd_game_id: normalized game}."""
     scores: dict[int, dict] = {}
     for game in raw:
         gid = game.get('id')
@@ -185,11 +169,102 @@ def fetch_live_scores(client: CFBDClient) -> dict[int, dict]:
             'away_points': away.get('points'),
             'home_cfbd_id': home.get('id'),
             'away_cfbd_id': away.get('id'),
+            'home_name': home.get('name'),
+            'away_name': away.get('name'),
             'period': game.get('period'),
             'clock': game.get('clock'),
             'start_date': game.get('startDate'),
+            'division': division,
+            # Scoreboard's own spread: a single provider, home-relative
+            # (negative = home favored). Only a fallback -- the stored
+            # provider average in game_lines is what the page displays.
+            'spread': (game.get('betting') or {}).get('spread'),
         }
     return scores
+
+
+def fetch_live_scores(client: CFBDClient) -> dict[int, dict]:
+    """
+    Call the CFBD scoreboard endpoint(s) and return a dict keyed by cfbd_game_id.
+
+    Each value: {status, home_points, away_points, home_cfbd_id, away_cfbd_id,
+    home_name, away_name, period, clock, start_date, division, spread}. status
+    is normalized to 'scheduled' / 'in_progress' / 'final'. division is 'fbs'
+    for any game with an FBS team (the default scoreboard) and 'fcs' for the
+    games only the FCS scoreboard returns (FCS-vs-FCS and FCS-vs-lower).
+
+    CFBD's /scoreboard GameStatus enum (per docs/cfbd-openapi.json) is actually
+    {scheduled, in_progress, completed} — it never returns 'final'. Every other
+    consumer in this codebase (_game_counts, _status_display, update_game_results,
+    the live status page's JS) was written expecting 'final', matching the
+    convention _fetch_final_scores() already normalizes to from the /games
+    endpoint's separate boolean `completed` field. Left unnormalized here, a
+    finished game's slot silently reverts to showing as "pending"/"not started"
+    the moment CFBD flips it from in_progress to completed, since nothing
+    downstream recognizes 'completed' as done. start_date is CFBD's raw ISO 8601
+    kickoff timestamp string (or None).
+
+    The FBS scoreboard is required; the FCS one is best-effort (a failure there
+    only costs the FCS live-games section, never the scoring itself). The FCS
+    scoreboard repeats FBS-home-vs-FCS games the FBS one already has -- those
+    stay 'fbs'.
+    """
+    scores = _normalize_scoreboard(client.get_scoreboard(), 'fbs')
+    try:
+        fcs_raw = client.get_scoreboard(classification='fcs')
+    except Exception as e:
+        print(f"[WARNING] FCS scoreboard fetch failed: {e}")
+        return scores
+    for gid, game in _normalize_scoreboard(fcs_raw, 'fcs').items():
+        scores.setdefault(gid, game)
+    return scores
+
+
+def refresh_game_lines(client: CFBDClient, year: int, week: int, live_scores: dict) -> int:
+    """
+    Capture pregame betting lines for the week into `game_lines`.
+
+    One CFBD /lines call covers every game that week (FBS and FCS). Each
+    game's spread is the mean across providers. Games that have already
+    kicked off are passed as locked, so their stored spread is frozen at
+    whatever was captured before kickoff (see upsert_game_lines). Any
+    scoreboard game /lines has nothing for falls back to the scoreboard's
+    single-provider spread. Returns the number of games written.
+    """
+    now = datetime.now(timezone.utc)
+    rows = []
+    seen = set()
+    for game in client.get_lines(year, week):
+        spread = average_spread(game.get('lines') or [])
+        if spread is None:
+            continue
+        gid = game['id']
+        live = live_scores.get(gid, {})
+        seen.add(gid)
+        rows.append({
+            'cfbd_game_id': gid,
+            'year': year,
+            'cfbd_week': week,
+            'home_team': game['homeTeam'],
+            'away_team': game['awayTeam'],
+            'home_spread': spread,
+            'n_providers': sum(1 for l in game['lines'] if l.get('spread') is not None),
+            'locked': game_started(live.get('status'), game.get('startDate'), now),
+        })
+    for gid, live in live_scores.items():
+        if gid in seen or live.get('spread') is None:
+            continue
+        rows.append({
+            'cfbd_game_id': gid,
+            'year': year,
+            'cfbd_week': week,
+            'home_team': live['home_name'],
+            'away_team': live['away_name'],
+            'home_spread': live['spread'],
+            'n_providers': 1,
+            'locked': game_started(live.get('status'), live.get('start_date'), now),
+        })
+    return upsert_game_lines(rows)
 
 
 # ------------------------------------------------------------------
@@ -207,6 +282,13 @@ def run_checkpoint(state: dict, client: CFBDClient, include_all_games: bool = Fa
     live_scores = fetch_live_scores(client)
     state['last_live_scores'] = live_scores
     now = datetime.now(timezone.utc)
+
+    # Pregame lines feed the projected-score display. Best-effort: a /lines
+    # or DB hiccup must never block scoring.
+    try:
+        refresh_game_lines(client, _get_season_year(state['season_id']), state['week'], live_scores)
+    except Exception as e:
+        print(f"[WARNING] Game lines refresh failed: {e}")
 
     # Mark any newly completed games (fetch_live_scores() normalizes CFBD's
     # 'completed' to 'final', so this only needs to check the one value)
@@ -658,6 +740,12 @@ def run_scheduler(
         print(f"Initial HTML page written: {path}")
     except Exception as e:
         print(f"[WARNING] Initial HTML page generation failed: {e}")
+
+    try:
+        n_lines = refresh_game_lines(client, _get_season_year(season_id), week, {})
+        print(f"Pregame lines captured for {n_lines} game(s).")
+    except Exception as e:
+        print(f"[WARNING] Initial game lines capture failed: {e}")
 
     try:
         push_website_update(season_id, week, live_scores={})

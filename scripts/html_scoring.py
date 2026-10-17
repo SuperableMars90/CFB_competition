@@ -43,6 +43,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from lib.db import (
     get_connection,
     get_conference_slot_tiers,
+    get_game_lines,
     get_lineup_team_ids,
     get_matchups_for_week,
     get_pick_results_by_player,
@@ -52,6 +53,7 @@ from lib.db import (
     get_team_week_results,
 )
 from lib.scoring import _slot_group
+from lib.projection import build_live_games, expected_margin, minutes_remaining, projected_margin
 from lib.metagame import get_scoring_context, compute_weekly_standings, build_season_leaderboard
 from lib.seeding import get_pvp_regular_season_records, record_and_margin
 from lib.optimal_lineup import P4_FLEX_CATEGORY, G6_FLEX_CATEGORY, WILDCARD_CATEGORY
@@ -222,11 +224,17 @@ def _load_prior_season_totals(season_id: int, week: int) -> dict[int, int]:
 # Slot resolution
 # ------------------------------------------------------------------
 
-def _build_slot(row: dict, live_scores: dict) -> dict:
+def _build_slot(row: dict, live_scores: dict, game_lines: Optional[dict] = None) -> dict:
     """
     Merge one DB row with live_scores data into a fully-resolved slot dict
     ready for rendering.
+
+    game_lines: {cfbd_game_id: {home_spread, ...}} from lib.db.get_game_lines().
+    Adds 'spread' (the picked team's expected margin, favorite positive, None
+    if there's no line) and 'proj' (projected final margin -- see
+    lib.projection). A PASS slot projects 0.
     """
+    game_lines = game_lines or {}
     is_pass = row['team_id'] is None
     is_week0 = bool(row['is_week0'])
     cfbd_game_id = row.get('cfbd_game_id')
@@ -249,6 +257,8 @@ def _build_slot(row: dict, live_scores: dict) -> dict:
             'picked_score': None,
             'opp_score': None,
             'margin': 0,
+            'spread': None,
+            'proj': 0,
         }
 
     team_id = row['team_id']
@@ -274,6 +284,18 @@ def _build_slot(row: dict, live_scores: dict) -> dict:
     else:
         picked_score = opp_score = margin = None
 
+    line = game_lines.get(cfbd_game_id) if cfbd_game_id else None
+    spread = expected_margin(line['home_spread'], home_id == team_id) if line else None
+    proj = projected_margin(
+        margin,
+        spread,
+        minutes_remaining(
+            game_status,
+            live.get('period') if live else None,
+            live.get('clock') if live else None,
+        ),
+    )
+
     return {
         'label': _slot_label(row['slot_type'], row['conference_slug']),
         'slot_type': row['slot_type'],
@@ -289,6 +311,8 @@ def _build_slot(row: dict, live_scores: dict) -> dict:
         'picked_score': picked_score,
         'opp_score': opp_score,
         'margin': margin,
+        'spread': spread,
+        'proj': proj,
     }
 
 
@@ -303,6 +327,22 @@ def _game_counts(slots: list[dict]) -> dict:
         'pending': pending,
         'pass_count': pass_count,
     }
+
+
+def _projection_totals(slots: list[dict]) -> tuple[float, int]:
+    """
+    (projected week total, number of slots with no line). A slot with no
+    line still projects to its current margin, so the total is never
+    silently short; the count lets the page flag that it's less certain.
+    Final games and PASS slots never count as missing a line -- their
+    projection is exact regardless.
+    """
+    total = round(sum(s['proj'] for s in slots), 1)
+    no_line = sum(
+        1 for s in slots
+        if not s['is_pass'] and s['game_status'] != 'final' and s['spread'] is None
+    )
+    return total, no_line
 
 
 # ------------------------------------------------------------------
@@ -543,6 +583,13 @@ def _build_summaries(season_id: int, week: int, live_scores: dict) -> list[dict]
     the DB-loading/aggregation logic exists in exactly one place.
     """
     rows = _load_picks_with_display(season_id, week)
+    try:
+        game_lines = get_game_lines(r['cfbd_game_id'] for r in rows)
+    except Exception as e:
+        # Lines only feed the projection display -- never let a missing
+        # table or DB hiccup take the whole scoring page down.
+        print(f"[WARNING] Could not load game lines: {e}")
+        game_lines = {}
     prior_totals = _load_prior_season_totals(season_id, week)
     pod_of_player = get_pod_membership_map(season_id)
     pod_names = _pod_names(season_id)
@@ -552,7 +599,7 @@ def _build_summaries(season_id: int, week: int, live_scores: dict) -> list[dict]
         pid = row['player_id']
         if pid not in players:
             players[pid] = {'name': row['player_name'], 'slots': []}
-        players[pid]['slots'].append(_build_slot(row, live_scores))
+        players[pid]['slots'].append(_build_slot(row, live_scores, game_lines))
 
     player_totals = {}
     partials = {}
@@ -571,6 +618,7 @@ def _build_summaries(season_id: int, week: int, live_scores: dict) -> list[dict]
     for pid, p in partials.items():
         name = p['name']
         season_total = prior_totals.get(pid, 0) + p['week']
+        proj_total, no_line = _projection_totals(p['slots'])
         standing = live_standings.get(pid)
 
         summaries.append({
@@ -583,6 +631,8 @@ def _build_summaries(season_id: int, week: int, live_scores: dict) -> list[dict]
             'g6': p['g6'],
             'wc': p['wc'],
             'week': p['week'],
+            'proj': proj_total,
+            'no_line': no_line,
             'season': season_total,
             'pod_rank': standing['pod_rank'] if standing else None,
             'overall_rank': standing['overall_rank'] if standing else None,
@@ -942,6 +992,21 @@ def _build_recap_payload(
 # than converting both at once.
 # ------------------------------------------------------------------
 
+def _game_owners(summaries: list[dict]) -> dict[int, dict[str, list[str]]]:
+    """{cfbd_game_id: {'home': [player names], 'away': [...]}} -- who has
+    each side of each game in this week's lineups."""
+    owners: dict[int, dict[str, list[str]]] = {}
+    for s in summaries:
+        for sl in s['slots']:
+            gid = sl['cfbd_game_id']
+            if sl['is_pass'] or not gid:
+                continue
+            names = owners.setdefault(gid, {'home': [], 'away': []})['home' if sl['is_home'] else 'away']
+            if s['name'] not in names:
+                names.append(s['name'])
+    return owners
+
+
 def _slot_payload(s: dict) -> dict:
     """One lineup slot, JSON-ready (drops the non-serializable game_time
     timedelta and the fields the new UI doesn't use)."""
@@ -956,6 +1021,8 @@ def _slot_payload(s: dict) -> dict:
         'picked': s['picked_score'],
         'oppScore': s['opp_score'],
         'margin': s['margin'],
+        'spread': s['spread'],
+        'proj': s['proj'],
         'cfbdGameId': s['cfbd_game_id'],
     }
 
@@ -967,6 +1034,7 @@ def _build_status_payload(
     matchups: list[dict],
     pvp_records: dict[int, dict],
     leaderboard,
+    live_games: Optional[list[dict]] = None,
 ) -> dict:
     """
     Pure transform -- no DB access here, everything's already been
@@ -981,6 +1049,8 @@ def _build_status_payload(
         'podId': s['pod_id'],
         'podName': s['pod_name'],
         'week': s['week'],
+        'proj': s['proj'],
+        'noLine': s['no_line'],
         'season': s['season'],
         'podRank': s['pod_rank'],
         'overallRank': s['overall_rank'],
@@ -1025,6 +1095,7 @@ def _build_status_payload(
         'players': players,
         'matchups': matchup_payload,
         'seasonRows': season_rows,
+        'liveGames': live_games or [],
     }
 
 
@@ -1165,6 +1236,11 @@ _STATUS_PAGE_TEMPLATE = """<!-- wp:html -->
   #cfb-status .cfb-game-status-txt.live { color: var(--live); font-weight: 700; }
   #cfb-status .cfb-subtotal-row td { font-weight: 700; border-top: 1px solid var(--line-strong); border-bottom: none !important; }
   #cfb-status .cfb-empty-state { text-align: center; padding: 30px 0; color: var(--ink-dim); font-size: 0.9rem; }
+  #cfb-status .cfb-spread { color: var(--ink-dim); font-weight: 600; font-variant-numeric: tabular-nums; }
+  #cfb-status .cfb-live-section { margin-top: 26px; display: flex; flex-direction: column; gap: 10px; }
+  #cfb-status table.cfb-live-games td.cfb-num, #cfb-status table.cfb-live-games th.cfb-num { text-align: right; }
+  #cfb-status table.cfb-live-games td.cfb-time { white-space: nowrap; color: var(--live); font-weight: 700; font-size: 0.78rem; }
+  #cfb-status .cfb-live-empty { color: var(--ink-dim); font-size: 0.84rem; padding: 10px 0 4px; }
 </style>
 
 <div id="cfb-status">
@@ -1222,6 +1298,11 @@ _STATUS_PAGE_TEMPLATE = """<!-- wp:html -->
     </div>
 
     <p class="cfb-empty-state" id="cfb-empty" hidden>No lineups submitted yet this week.</p>
+
+    <div class="cfb-live-section" id="cfb-live-section">
+      <details class="cfb-player-card" id="cfb-live-fbs"></details>
+      <details class="cfb-player-card" id="cfb-live-fcs"></details>
+    </div>
   </div>
 </div>
 
@@ -1233,11 +1314,57 @@ _STATUS_PAGE_TEMPLATE = """<!-- wp:html -->
   var root = document.getElementById('cfb-status');
 
   function fmtSigned(n) { return (n > 0 ? '+' : '') + n; }
+  // Whole numbers stay whole, fractions get one decimal; never "-0".
+  function fmtNum(n) { var r = Math.round(n * 10) / 10; return r === 0 ? '0' : String(r); }
+  function fmtSignedNum(n) { var r = Math.round(n * 10) / 10; return (r > 0 ? '+' : '') + fmtNum(r); }
+  function esc(t) {
+    return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+  // A kickoff spread next to a team name: favorite positive, e.g. (+10).
+  function spreadTag(v) {
+    return v == null ? '' : ' <span class="cfb-spread">(' + fmtSignedNum(v) + ')</span>';
+  }
+  // Players holding a team this week, e.g. (Jacob, Dan).
+  function playersTag(names) {
+    return names && names.length ? ' <span class="cfb-spread">(' + esc(names.join(', ')) + ')</span>' : '';
+  }
+  // The single kickoff line, on the favorite only, e.g. "Florida (-7)".
+  function favTag(g) {
+    if (g.favLine == null) return '';
+    var txt = g.favorite ? esc(g.favorite) + ' (' + fmtSignedNum(g.favLine) + ')' : 'PK';
+    return ' <span class="cfb-spread">&middot; ' + txt + '</span>';
+  }
   function podChip(podName) {
     if (!podName) return '';
     var cls = /orange/i.test(podName) ? 'orange' : 'white';
     return '<span class="cfb-pod-chip ' + cls + '" title="' + podName + '"></span>';
   }
+
+  // ---- Live games (every FBS / FCS game in progress; collapsed by default) ----
+  function renderLiveGames(elId, title, games) {
+    var el = document.getElementById(elId);
+    var body;
+    if (!games.length) {
+      body = '<p class="cfb-live-empty">No games in progress right now.</p>';
+    } else {
+      body = '<table class="cfb-slots cfb-live-games"><thead><tr><th>Away</th><th class="cfb-num">Score</th><th>Home</th><th>Time</th></tr></thead><tbody>' +
+        games.map(function (g) {
+          var score = g.awayPts + '&ndash;' + g.homePts;
+          return '<tr><td>' + esc(g.away) + playersTag(g.awayPlayers) + '</td>' +
+            '<td class="cfb-num"><a href="' + ESPN_URL + g.id + '" target="_blank" rel="noopener"><span class="cfb-score-txt">' + score + '</span></a></td>' +
+            '<td>' + esc(g.home) + playersTag(g.homePlayers) + '</td>' +
+            '<td class="cfb-time">' + esc(g.time) + favTag(g) + '</td></tr>';
+        }).join('') + '</tbody></table>';
+    }
+    el.innerHTML =
+      '<summary class="cfb-card-summary"><span class="cfb-name">' + title + '</span>' +
+      '<span class="cfb-spacer"></span>' +
+      '<span class="cfb-status-pill ' + (games.length ? 'live' : 'done') + '">' + games.length + ' live</span></summary>' +
+      '<div class="cfb-card-body">' + body + '</div>';
+  }
+  var liveGames = DATA.liveGames || [];
+  renderLiveGames('cfb-live-fbs', 'Live FBS games', liveGames.filter(function (g) { return g.division !== 'fcs'; }));
+  renderLiveGames('cfb-live-fcs', 'Live FCS games', liveGames.filter(function (g) { return g.division === 'fcs'; }));
 
   document.getElementById('cfb-title').textContent = 'CFB Fantasy \\u2014 Week ' + DATA.week + ' Status';
   document.getElementById('cfb-masthead-updated').textContent = DATA.updatedAt;
@@ -1380,7 +1507,7 @@ _STATUS_PAGE_TEMPLATE = """<!-- wp:html -->
     var marginTxt = s.margin == null ? '&mdash;' : fmtSigned(s.margin);
     var marginCls = s.margin == null ? '' : (s.margin > 0 ? 'pos' : (s.margin < 0 ? 'neg' : ''));
     var oppTxt = (s.isHome ? 'vs ' : '@ ') + (s.opp || '');
-    return '<tr><td class="cfb-slot-label">' + s.lbl + '</td><td><b>' + s.team + '</b></td><td>' + oppTxt + '</td>' +
+    return '<tr><td class="cfb-slot-label">' + s.lbl + '</td><td><b>' + s.team + '</b>' + spreadTag(s.spread) + '</td><td>' + oppTxt + '</td>' +
       '<td>' + scoreTxt + '</td><td class="cfb-margin ' + marginCls + '">' + marginTxt + '</td></tr>';
   }
 
@@ -1413,6 +1540,8 @@ _STATUS_PAGE_TEMPLATE = """<!-- wp:html -->
       '<span class="cfb-rank-badge ' + (p.overallRank === 1 ? 'top' : '') + '">' + (p.overallRank || '&ndash;') + '</span>' +
       '<div class="cfb-name-block">' + podChip(p.podName) + '<span class="cfb-name">' + p.name + '</span></div>' +
       '<span class="cfb-spacer"></span>' +
+      '<span class="cfb-stat-chip"' + (p.noLine ? ' title="' + p.noLine + ' unfinished pick(s) have no betting line and are projected at their current margin"' : '') + '>' +
+        'Week Proj<b>' + fmtSignedNum(p.proj) + (p.noLine ? '*' : '') + '</b></span>' +
       '<span class="cfb-stat-chip">Week<b>' + fmtSigned(p.week) + '</b></span>' +
       (p.matchPts != null ? '<span class="cfb-stat-chip">Match Pts<b>' + p.matchPts + '</b></span>' : '') +
       '<span class="cfb-stat-chip">Season<b>' + fmtSigned(p.season) + '</b></span>' +
@@ -1523,8 +1652,11 @@ def render_fragment(season_id: int, week: int, live_scores: dict) -> str:
     """
     Build the WordPress-postable (and locally-embeddable) fragment for a
     week's live scoring content: pod comparison, PVP matchups, this-week
-    and season standings, and collapsible per-player cards with a
-    filter/sort/search toolbar (T20, redesigned 2026-07-06). A JSON data
+    and season standings, collapsible per-player cards with a
+    filter/sort/search toolbar (T20, redesigned 2026-07-06), and two
+    collapsed-by-default lists of every FBS / FCS game in progress right
+    now. Each player card also carries a projected week total and each
+    pick's kickoff spread (see lib/projection.py). A JSON data
     payload + a shared JS renderer (_STATUS_PAGE_TEMPLATE), not
     Python-built HTML strings -- see the module comment above
     _slot_payload() for why. Wrapped in a Gutenberg Custom HTML block
@@ -1552,8 +1684,16 @@ def render_fragment(season_id: int, week: int, live_scores: dict) -> str:
     pvp_records = _pvp_records_through_week(season_id, week, scoring_context_id) if scoring_context_id else {}
     leaderboard = build_season_leaderboard(season_id)
 
+    in_progress_ids = [gid for gid, g in live_scores.items() if g.get('status') == 'in_progress']
+    try:
+        live_lines = get_game_lines(in_progress_ids)
+    except Exception as e:
+        print(f"[WARNING] Could not load game lines for live games list: {e}")
+        live_lines = {}
+    live_games = build_live_games(live_scores, live_lines, _game_owners(summaries))
+
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-    payload = _build_status_payload(week, timestamp, summaries, matchups, pvp_records, leaderboard)
+    payload = _build_status_payload(week, timestamp, summaries, matchups, pvp_records, leaderboard, live_games)
     return _render_status_page(payload)
 
 

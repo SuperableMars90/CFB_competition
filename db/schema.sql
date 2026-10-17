@@ -92,6 +92,25 @@ CREATE TABLE IF NOT EXISTS games (
     UNIQUE KEY uq_cfbd_game (cfbd_game_id)
 );
 
+-- Pregame betting lines, one row per CFBD game (including FCS-vs-FCS games,
+-- which have no row in `games`, hence no FK). home_spread is the average of
+-- every provider's spread in CFBD's convention (negative = home favored).
+-- Refreshed until kickoff; `locked` is set once the game starts and the row
+-- is never updated again, so the spread is always the pre-kickoff line.
+CREATE TABLE IF NOT EXISTS game_lines (
+    cfbd_game_id    INT NOT NULL PRIMARY KEY,
+    year            INT NOT NULL,
+    cfbd_week       INT NOT NULL,
+    home_team       VARCHAR(100) NOT NULL COMMENT 'School name as CFBD /lines reports it (no mascot)',
+    away_team       VARCHAR(100) NOT NULL,
+    home_spread     DECIMAL(5,2) NOT NULL COMMENT 'Mean provider spread; negative = home favored',
+    n_providers     INT NOT NULL,
+    locked          BOOLEAN NOT NULL DEFAULT FALSE,
+    captured_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    KEY idx_game_lines_week (year, cfbd_week)
+);
+
 -- -------------------------------------------------------------
 -- METAGAME LAYER
 -- -------------------------------------------------------------

@@ -18,6 +18,7 @@ from typing import Optional
 import mysql.connector
 import streamlit as st
 
+from lib import roster_history
 from lib.game_context import GameLocation, TeamGameContext
 from lib.game_rules import Pick, SlotType
 
@@ -578,6 +579,46 @@ def get_owned_team_ids(season_id: int, pod_id: int) -> set[int]:
     return {r[0] for r in rows}
 
 
+def get_rosters_as_of(season_id: int, as_of_et: datetime, verify: bool = True) -> dict[int, set[int]]:
+    """
+    {player_id: {team_id, ...}} as owned at as_of_et — an ET wall-clock
+    time (naive = America/New_York; converted to UTC internally, since
+    DB timestamps are UTC). Players owning nothing then are omitted; join
+    get_pod_membership_map() for pods.
+
+    Reconstructed from rosters (source of truth). With verify=True, also
+    replays drop_add_log backwards and raises RosterHistoryMismatch if
+    the two disagree. See lib/roster_history.py.
+    """
+    as_of_utc = roster_history.et_to_utc(as_of_et)
+    with get_connection() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT player_id, team_id, acquired_at, dropped_at FROM rosters WHERE season_id = %s",
+            (season_id,),
+        )
+        roster_rows = cur.fetchall()
+        log_rows = []
+        if verify:
+            cur.execute(
+                """
+                SELECT id, player_id, dropped_team_id, added_team_id, actioned_at
+                FROM drop_add_log WHERE season_id = %s
+                """,
+                (season_id,),
+            )
+            log_rows = cur.fetchall()
+        cur.close()
+
+    result = roster_history.rosters_as_of(roster_rows, as_of_utc)
+    if verify:
+        from_log, anomalies = roster_history.replay_log_backwards(roster_rows, log_rows, as_of_utc)
+        discrepancies = roster_history.compare_reconstructions(result, from_log, log_rows, as_of_utc)
+        if discrepancies or anomalies:
+            raise roster_history.RosterHistoryMismatch(as_of_utc, discrepancies, anomalies)
+    return result
+
+
 def create_dropadd_request(
     player_id: int,
     season_id: int,
@@ -735,11 +776,11 @@ def decide_dropadd_request(request_id: int, decided_by: int, approve: bool) -> N
         except Exception as e:
             print(f"[WARNING] Rosters local file refresh failed: {e}")
 
-        try:
-            from scripts.html_rosters import push_rosters_page
-            push_rosters_page(req["season_id"])
-        except Exception as e:
-            print(f"[WARNING] Rosters WordPress push failed: {e}")
+        # WordPress push disabled 2026-09-19: the live page (id 100) now holds
+        # the Scoring Guide + Records table with no ROSTERS markers, and
+        # push_rosters_page() would fall back to the "Records and Awards"
+        # heading anchor and overwrite everything above it. Re-enable only
+        # after giving rosters their own page or restoring the markers.
 
 
 @st.cache_data(ttl=3600)
@@ -1085,6 +1126,79 @@ def update_game_results(games: dict[int, dict]) -> int:
         finally:
             cur.close()
     return n
+
+
+def upsert_game_lines(rows: list[dict]) -> int:
+    """
+    Persist pregame betting lines onto `game_lines`, keyed by cfbd_game_id.
+
+    Each row: {cfbd_game_id, year, cfbd_week, home_team, away_team,
+    home_spread, n_providers, locked}. `home_spread` is CFBD's home-relative
+    convention (negative = home favored).
+
+    A game's spread is the pre-kickoff line and must never change after
+    kickoff: an unlocked row is refreshed with the new spread; a row passed
+    with locked=True (game already started) is inserted if it's missing but
+    otherwise only gets its `locked` flag set -- its spread is left alone.
+    Once locked, a row is never updated again. Returns rows submitted.
+    """
+    if not rows:
+        return 0
+    sql = """
+        INSERT INTO game_lines
+            (cfbd_game_id, year, cfbd_week, home_team, away_team,
+             home_spread, n_providers, locked)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            home_spread = IF(locked = 1 OR VALUES(locked) = 1, home_spread, VALUES(home_spread)),
+            n_providers = IF(locked = 1 OR VALUES(locked) = 1, n_providers, VALUES(n_providers)),
+            locked      = IF(VALUES(locked) = 1, 1, locked)
+    """
+    params = [
+        (r["cfbd_game_id"], r["year"], r["cfbd_week"], r["home_team"], r["away_team"],
+         r["home_spread"], r["n_providers"], 1 if r["locked"] else 0)
+        for r in rows
+    ]
+    with get_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.executemany(sql, params)
+            conn.commit()
+        finally:
+            cur.close()
+    return len(rows)
+
+
+def get_game_lines(cfbd_game_ids) -> dict[int, dict]:
+    """
+    Stored pregame lines for the given CFBD game ids:
+    {cfbd_game_id: {home_spread (float), home_team, away_team}}. Games with
+    no stored line are simply absent. Not cached -- the live scoring page
+    wants the latest capture each checkpoint.
+    """
+    ids = sorted({int(i) for i in cfbd_game_ids if i is not None})
+    if not ids:
+        return {}
+    placeholders = ",".join(["%s"] * len(ids))
+    with get_connection() as conn:
+        cur = conn.cursor(dictionary=True)
+        try:
+            cur.execute(
+                f"SELECT cfbd_game_id, home_spread, home_team, away_team "
+                f"FROM game_lines WHERE cfbd_game_id IN ({placeholders})",
+                ids,
+            )
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+    return {
+        r["cfbd_game_id"]: {
+            "home_spread": float(r["home_spread"]),
+            "home_team": r["home_team"],
+            "away_team": r["away_team"],
+        }
+        for r in rows
+    }
 
 
 @st.cache_data(ttl=60)
