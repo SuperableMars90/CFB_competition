@@ -3,14 +3,17 @@ Drop/add request page.
 
 Flow: auth login -> submit a drop/add request (drop only, add only, or
 both) -> request is validated and written to dropadd_requests as pending
--> a commissioner reviews pending requests below and approves or denies
-them. Approval applies the roster change (rosters + drop_add_log) in the
-same transaction as the status update — see lib.db.decide_dropadd_request.
+-> a commissioner reviews pending requests below, marks any subset
+Approve / Deny, and applies them as one all-or-nothing batch. The batch
+is re-validated against current rosters (stale drops, duplicate drops or
+adds, roster size) before anything is written — see
+lib.db.decide_dropadd_requests.
 
 Not yet decided (see TODO.md): weekly request limits, a lock window near
 kickoff, and whether a player can cancel their own pending request.
 """
 
+import pandas as pd
 import streamlit as st
 
 from lib.auth import get_logged_in_player
@@ -20,14 +23,16 @@ from lib.db import (
     get_owned_team_ids,
     create_dropadd_request,
     get_dropadd_requests,
-    decide_dropadd_request,
+    decide_dropadd_requests,
     get_current_week,
+    DropAddBatchError,
     DropAddRequestError,
 )
-from lib.dropadd_rules import validate_dropadd_request
+from lib.dropadd_rules import validate_dropadd_request, find_shared_drops
 from lib.config import CURRENT_SEASON_ID
 
 NONE_LABEL = "— None —"
+LEAVE, APPROVE, DENY = "—", "Approve", "Deny"
 
 st.title("Drop / Add")
 
@@ -147,30 +152,95 @@ if player["is_commissioner"]:
     st.divider()
     st.subheader("Commissioner: pending requests")
 
+    batch_msg = st.session_state.pop("dropadd_batch_done", None)
+    if batch_msg:
+        st.success(batch_msg)
+
     pending = get_dropadd_requests(season_id, status="pending")
     if not pending:
         st.write("No pending requests.")
     else:
-        for r in pending:
-            drop_label = r["dropped_team_name"] or NONE_LABEL
-            add_label = r["added_team_name"] or NONE_LABEL
-            st.write(
-                f"**{r['player_name']}**, week {r['week']}: "
-                f"drop {drop_label}, add {add_label}"
-                + (f" — _{r['notes']}_" if r["notes"] else "")
-            )
-            col1, col2 = st.columns(2)
-            if col1.button("Approve", key=f"approve_{r['id']}"):
-                try:
-                    decide_dropadd_request(r["id"], decided_by=player_id, approve=True)
-                    st.success(f"Approved request {r['id']}.")
-                    st.rerun()
-                except DropAddRequestError as e:
-                    st.error(str(e))
-            if col2.button("Deny", key=f"deny_{r['id']}"):
-                try:
-                    decide_dropadd_request(r["id"], decided_by=player_id, approve=False)
-                    st.info(f"Denied request {r['id']}.")
-                    st.rerun()
-                except DropAddRequestError as e:
-                    st.error(str(e))
+        pending_ids = {r["id"] for r in pending}
+        shared = find_shared_drops(pending)
+
+        sort_mode = st.radio(
+            "Sort by", ["Date/time", "Player"], horizontal=True, key="dropadd_sort"
+        )
+        if sort_mode == "Player":
+            rows = sorted(pending, key=lambda r: (r["player_name"], r["requested_at"], r["id"]))
+        else:
+            rows = sorted(pending, key=lambda r: (r["requested_at"], r["id"]))
+
+        # Chosen actions live in session_state keyed by request id, so they
+        # survive a sort change. The editor's own edits are positional, so
+        # each (sort, pending-set) combination gets its own editor key, and
+        # its base data is snapshotted once when that key first appears —
+        # the data passed to a keyed editor must not change under it.
+        actions: dict[int, str] = st.session_state.setdefault("dropadd_actions", {})
+        for rid in list(actions):
+            if rid not in pending_ids:
+                del actions[rid]
+        editor_key = f"dropadd_editor_{sort_mode}_{hash(tuple(sorted(pending_ids)))}"
+        if st.session_state.get("dropadd_editor_key") != editor_key:
+            st.session_state["dropadd_editor_key"] = editor_key
+            st.session_state["dropadd_editor_base"] = dict(actions)
+        base = st.session_state["dropadd_editor_base"]
+
+        df = pd.DataFrame([
+            {
+                "#": r["id"],
+                "Action": base.get(r["id"], LEAVE),
+                "Player": r["player_name"],
+                "Requested": r["requested_at"],
+                "Wk": r["week"],
+                "Drop": r["dropped_team_name"] or NONE_LABEL,
+                "Add": r["added_team_name"] or NONE_LABEL,
+                "Flag": "⚠ same drop" if r["id"] in shared else "",
+                "Note": r["notes"] or "",
+            }
+            for r in rows
+        ]).set_index("#")
+
+        st.caption(
+            "Set Action on the rows you want to decide; rows left at — stay "
+            "pending. ⚠ same drop = this player has several pending requests "
+            "dropping the same team (ranked fallbacks) — approve at most one."
+        )
+        edited = st.data_editor(
+            df,
+            key=editor_key,
+            width="stretch",
+            disabled=[c for c in df.columns if c != "Action"],
+            column_config={
+                "Action": st.column_config.SelectboxColumn(
+                    options=[LEAVE, APPROVE, DENY], required=True, width="small"
+                ),
+                "Requested": st.column_config.DatetimeColumn(format="MMM D, h:mm:ss a"),
+                "Note": st.column_config.TextColumn(width="large"),
+            },
+        )
+        for rid, act in edited["Action"].items():
+            actions[int(rid)] = act
+
+        to_apply = [(rid, act == APPROVE) for rid, act in actions.items() if act in (APPROVE, DENY)]
+        n_approve = sum(1 for _, a in to_apply if a)
+        n_deny = len(to_apply) - n_approve
+        st.write(f"**{n_approve}** to approve, **{n_deny}** to deny.")
+
+        if st.button("Apply decisions", type="primary", disabled=not to_apply):
+            try:
+                decide_dropadd_requests(to_apply, decided_by=player_id)
+            except DropAddBatchError as e:
+                st.error(
+                    "Nothing was applied. Fix these and apply again:\n\n"
+                    + "\n".join(f"- {err}" for err in e.errors)
+                )
+            except DropAddRequestError as e:
+                st.error(f"Nothing was applied: {e}")
+            else:
+                st.session_state["dropadd_batch_done"] = (
+                    f"Applied {n_approve} approval(s) and {n_deny} denial(s)."
+                )
+                for k in ("dropadd_actions", "dropadd_editor_key", "dropadd_editor_base"):
+                    st.session_state.pop(k, None)
+                st.rerun()

@@ -110,6 +110,44 @@ def projected_margin(
     return base + team_expected_margin * (minutes_left / REGULATION_MINUTES)
 
 
+def slot_projection(pick: dict, live_game: Optional[dict], line: Optional[dict]) -> dict:
+    """
+    Projection fields for one scored pick, for the scoring checkpoint JSON:
+    {cfbd_game_id, is_home, period, clock, spread, proj}. Stored alongside
+    the inputs so a checkpoint records both what the page showed and enough
+    to recompute it.
+
+    pick: a lib.scoring.score_picks() row (is_pass, team_id, home_team_id,
+        cfbd_game_id, margin, game_status).
+    live_game: that game's fetch_live_scores() entry, or None.
+    line: that game's lib.db.get_game_lines() entry, or None.
+
+    Matches the status page's per-slot math (scripts/html_scoring.py
+    _build_slot): a PASS projects 0, a missing line falls back to the
+    current margin.
+    """
+    if pick.get("is_pass"):
+        return {"cfbd_game_id": None, "is_home": None, "period": None,
+                "clock": None, "spread": None, "proj": 0}
+    is_home = pick["home_team_id"] == pick["team_id"]
+    period = live_game.get("period") if live_game else None
+    clock = live_game.get("clock") if live_game else None
+    spread = expected_margin(line["home_spread"], is_home) if line else None
+    proj = projected_margin(
+        pick.get("margin"),
+        spread,
+        minutes_remaining(pick.get("game_status"), period, clock),
+    )
+    return {
+        "cfbd_game_id": pick.get("cfbd_game_id"),
+        "is_home": is_home,
+        "period": period,
+        "clock": clock,
+        "spread": spread,
+        "proj": round(proj, 2),
+    }
+
+
 def game_started(status: Optional[str], start_date: Optional[str], now: datetime) -> bool:
     """
     True once a game has kicked off. Trusts the scoreboard status when there

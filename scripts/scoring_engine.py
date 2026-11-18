@@ -64,8 +64,10 @@ import matplotlib.dates as mdates
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from lib.config import CURRENT_SEASON_ID
-from lib.db import get_connection, update_game_results, get_pod_membership_map, upsert_game_lines
-from lib.projection import average_spread, game_started
+from lib.db import (
+    get_connection, update_game_results, get_pod_membership_map, upsert_game_lines, get_game_lines,
+)
+from lib.projection import average_spread, game_started, slot_projection
 from lib.scoring import (
     load_week_picks,
     score_picks,
@@ -300,6 +302,17 @@ def run_checkpoint(state: dict, client: CFBDClient, include_all_games: bool = Fa
     player_totals = compute_player_totals(scored)
     table = build_score_table(player_totals)
 
+    # Projection inputs + result per slot, so a checkpoint can show what the
+    # status page projected at that moment. Best-effort like the lines refresh.
+    try:
+        lines = get_game_lines(s['cfbd_game_id'] for s in scored if s.get('cfbd_game_id'))
+    except Exception as e:
+        print(f"[WARNING] Game lines lookup for checkpoint failed: {e}")
+        lines = {}
+    for s in scored:
+        gid = s.get('cfbd_game_id')
+        s.update(slot_projection(s, live_scores.get(gid) if gid else None, lines.get(gid) if gid else None))
+
     # Game counts for status summary
     week_game_ids = state['live_game_ids']
     n_total = len(week_game_ids)
@@ -322,6 +335,7 @@ def run_checkpoint(state: dict, client: CFBDClient, include_all_games: bool = Fa
                 'g6_subtotal': data['g6'],
                 'wildcard_score': data['wildcard'],
                 'total': data['total'],
+                'proj_total': round(sum(s['proj'] for s in data['slots']), 2),
                 'slots': [
                     {
                         'slot_type': s['slot_type'],
@@ -332,6 +346,12 @@ def run_checkpoint(state: dict, client: CFBDClient, include_all_games: bool = Fa
                         'is_pass': s['is_pass'],
                         'game_status': s.get('game_status'),
                         'margin': s.get('margin'),
+                        'cfbd_game_id': s['cfbd_game_id'],
+                        'is_home': s['is_home'],
+                        'period': s['period'],
+                        'clock': s['clock'],
+                        'spread': s['spread'],
+                        'proj': s['proj'],
                     }
                     for s in data['slots']
                 ],

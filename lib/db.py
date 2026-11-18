@@ -19,6 +19,7 @@ import mysql.connector
 import streamlit as st
 
 from lib import roster_history
+from lib.dropadd_rules import validate_dropadd_batch
 from lib.game_context import GameLocation, TeamGameContext
 from lib.game_rules import Pick, SlotType
 
@@ -470,6 +471,39 @@ def get_matchups_for_week(season_id: int, scoring_context_id: int, week: int) ->
     return rows
 
 
+def get_playoff_matchups_for_week(season_id: int, scoring_context_id: int, week: int) -> list[dict]:
+    """
+    This week's playoff_games rows in get_matchups_for_week()'s exact
+    shape, so the status/recap pages can render them alongside (or, in
+    playoff weeks, instead of) regular-season matchup_pairings.
+    matchup_type is 'playoff' for bracket games, 'exhibition' for
+    exhibition games. Rows whose sides haven't resolved to real players
+    yet (TBD, set later by seed_playoffs.py / advance_playoffs.py) are
+    skipped. winner_id/is_tie stay NULL/False until advance_playoffs.py
+    resolves the week.
+    """
+    query = """
+        SELECT pg.id,
+               CASE WHEN pg.game_type = 'exhibition' THEN 'exhibition' ELSE 'playoff' END AS matchup_type,
+               pg.player_a_id, pa.name AS player_a_name,
+               pg.player_b_id, pb.name AS player_b_name,
+               pg.winner_id, pg.is_tie
+        FROM playoff_games pg
+        JOIN players pa ON pa.id = pg.player_a_id
+        JOIN players pb ON pb.id = pg.player_b_id
+        WHERE pg.season_id = %s AND pg.scoring_context_id = %s AND pg.week = %s
+        ORDER BY pg.game_number
+    """
+    with get_connection() as conn:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(query, (season_id, scoring_context_id, week))
+        rows = cur.fetchall()
+        cur.close()
+    for r in rows:
+        r['is_tie'] = bool(r['is_tie'])
+    return rows
+
+
 def get_lineup_team_ids(season_id: int, week: int) -> dict[int, set[int]]:
     """{player_id: {team_id, ...}} -- the teams actually played (not
     passed) in each player's submitted lineup for this week. A player
@@ -681,98 +715,179 @@ def get_dropadd_requests(season_id: int, status: Optional[str] = None) -> list[d
 
 
 class DropAddRequestError(Exception):
-    """Raised when a drop/add request can't be decided (missing, already decided)."""
+    """Raised when a drop/add request can't be decided (missing, already decided, or invalid)."""
+
+
+class DropAddBatchError(DropAddRequestError):
+    """
+    Raised when a batch of drop/add decisions fails validation. Nothing in
+    the batch was applied. .errors lists every problem found, so the
+    commissioner can fix the whole selection in one pass.
+    """
+
+    def __init__(self, errors: list[str]):
+        self.errors = list(errors)
+        super().__init__("\n".join(self.errors))
 
 
 def decide_dropadd_request(request_id: int, decided_by: int, approve: bool) -> None:
-    """
-    Approve or deny a pending drop/add request.
+    """Approve or deny one pending request — a batch of one; see decide_dropadd_requests."""
+    decide_dropadd_requests([(request_id, approve)], decided_by)
 
-    On approval: deactivates the dropped roster row (if any), inserts the
-    added roster row (if any) as a free_agent acquisition, and logs the
-    completed transaction to drop_add_log — all in the same transaction as
-    the status update. Raises DropAddRequestError if the request is missing
-    or already decided.
+
+def decide_dropadd_requests(decisions: list[tuple[int, bool]], decided_by: int) -> None:
     """
+    Apply a batch of (request_id, approve) decisions, all or nothing.
+
+    Every request must exist, be pending, and belong to one season. The
+    approvals are validated together against the current rosters (read in
+    the same transaction) by lib.dropadd_rules.validate_dropadd_batch —
+    stale drops, two approvals dropping or adding the same team, and any
+    touched player ending off roster size all reject the whole batch with
+    DropAddBatchError. Valid approvals are then applied oldest-first: the
+    dropped roster row is deactivated, the added row inserted as a
+    free_agent acquisition, and the transaction logged to drop_add_log.
+    Each roster write must hit exactly one row or the batch rolls back —
+    an unmatched drop used to be a silent no-op (2026 weeks 10-11).
+    Denials only update status.
+    """
+    if not decisions:
+        return
+    ids = [rid for rid, _ in decisions]
+    if len(set(ids)) != len(ids):
+        raise DropAddBatchError(["A request appears more than once in the batch."])
+    approve_by_id = dict(decisions)
+
     with get_connection() as conn:
         cur = conn.cursor(dictionary=True)
         try:
+            ph = ", ".join(["%s"] * len(ids))
             cur.execute(
-                "SELECT * FROM dropadd_requests WHERE id = %s FOR UPDATE",
-                (request_id,),
+                f"""
+                SELECT * FROM dropadd_requests WHERE id IN ({ph})
+                ORDER BY requested_at, id FOR UPDATE
+                """,
+                tuple(ids),
             )
-            req = cur.fetchone()
-            if req is None:
-                raise DropAddRequestError(f"Drop/add request {request_id} not found.")
-            if req["status"] != "pending":
-                raise DropAddRequestError(
-                    f"Drop/add request {request_id} was already {req['status']}."
+            reqs = cur.fetchall()
+
+            found = {r["id"] for r in reqs}
+            errors = [f"Drop/add request {rid} not found." for rid in ids if rid not in found]
+            errors += [
+                f"Drop/add request {r['id']} was already {r['status']}."
+                for r in reqs if r["status"] != "pending"
+            ]
+            seasons = {r["season_id"] for r in reqs}
+            if len(seasons) > 1:
+                errors.append("Batch mixes requests from more than one season.")
+            if errors:
+                raise DropAddBatchError(errors)
+
+            approvals = [r for r in reqs if approve_by_id[r["id"]]]
+            if approvals:
+                season_id = approvals[0]["season_id"]
+
+                cur.execute(
+                    "SELECT player_id, team_id FROM rosters WHERE season_id = %s AND is_active = 1 FOR UPDATE",
+                    (season_id,),
                 )
+                rosters: dict[int, set[int]] = {}
+                for row in cur.fetchall():
+                    rosters.setdefault(row["player_id"], set()).add(row["team_id"])
 
-            new_status = "approved" if approve else "denied"
+                cur.execute(
+                    "SELECT player_id, pod_id FROM pod_memberships WHERE season_id = %s",
+                    (season_id,),
+                )
+                pod_of = {row["player_id"]: row["pod_id"] for row in cur.fetchall()}
 
-            if approve:
-                if req["dropped_team_id"] is not None:
+                cur.execute("SELECT draft_picks_per_player FROM seasons WHERE id = %s", (season_id,))
+                roster_size = cur.fetchone()["draft_picks_per_player"]
+
+                pids = sorted({r["player_id"] for r in approvals})
+                cur.execute(
+                    f"SELECT id, name FROM players WHERE id IN ({', '.join(['%s'] * len(pids))})",
+                    tuple(pids),
+                )
+                names = {row["id"]: row["name"] for row in cur.fetchall()}
+                for r in approvals:
+                    r["player_name"] = names.get(r["player_id"])
+
+                result = validate_dropadd_batch(approvals, rosters, pod_of, roster_size)
+                if not result.is_valid:
+                    raise DropAddBatchError(result.errors)
+
+                for req in approvals:
+                    if req["dropped_team_id"] is not None:
+                        cur.execute(
+                            """
+                            UPDATE rosters SET is_active = 0, dropped_at = NOW()
+                            WHERE player_id = %s AND team_id = %s AND season_id = %s
+                              AND is_active = 1
+                            """,
+                            (req["player_id"], req["dropped_team_id"], req["season_id"]),
+                        )
+                        if cur.rowcount != 1:
+                            raise DropAddBatchError([
+                                f"Request #{req['id']}: drop matched {cur.rowcount} active roster rows, expected 1."
+                            ])
+                    if req["added_team_id"] is not None:
+                        cur.execute(
+                            """
+                            INSERT INTO rosters
+                                (player_id, team_id, season_id, pod_id, is_active, acquired_at, acquisition_type)
+                            SELECT %s, %s, %s, pm.pod_id, TRUE, NOW(), 'free_agent'
+                            FROM pod_memberships pm
+                            WHERE pm.player_id = %s AND pm.season_id = %s
+                            """,
+                            (req["player_id"], req["added_team_id"], req["season_id"],
+                             req["player_id"], req["season_id"]),
+                        )
+                        if cur.rowcount != 1:
+                            raise DropAddBatchError([
+                                f"Request #{req['id']}: add inserted {cur.rowcount} roster rows, expected 1."
+                            ])
                     cur.execute(
                         """
-                        UPDATE rosters SET is_active = 0, dropped_at = NOW()
-                        WHERE player_id = %s AND team_id = %s AND season_id = %s
-                          AND is_active = 1
+                        INSERT INTO drop_add_log
+                            (player_id, season_id, week, dropped_team_id, added_team_id, actioned_by)
+                        VALUES (%s, %s, %s, %s, %s, %s)
                         """,
-                        (req["player_id"], req["dropped_team_id"], req["season_id"]),
+                        (
+                            req["player_id"], req["season_id"], req["week"],
+                            req["dropped_team_id"], req["added_team_id"], decided_by,
+                        ),
                     )
-                if req["added_team_id"] is not None:
-                    cur.execute(
-                        """
-                        INSERT INTO rosters
-                            (player_id, team_id, season_id, pod_id, is_active, acquired_at, acquisition_type)
-                        SELECT %s, %s, %s, pm.pod_id, TRUE, NOW(), 'free_agent'
-                        FROM pod_memberships pm
-                        WHERE pm.player_id = %s AND pm.season_id = %s
-                        """,
-                        (req["player_id"], req["added_team_id"], req["season_id"],
-                         req["player_id"], req["season_id"]),
-                    )
+
+            for req in reqs:
                 cur.execute(
                     """
-                    INSERT INTO drop_add_log
-                        (player_id, season_id, week, dropped_team_id, added_team_id, actioned_by)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    UPDATE dropadd_requests
+                    SET status = %s, decided_at = NOW(), decided_by = %s
+                    WHERE id = %s
                     """,
-                    (
-                        req["player_id"], req["season_id"], req["week"],
-                        req["dropped_team_id"], req["added_team_id"], decided_by,
-                    ),
+                    ("approved" if approve_by_id[req["id"]] else "denied", decided_by, req["id"]),
                 )
-
-            cur.execute(
-                """
-                UPDATE dropadd_requests
-                SET status = %s, decided_at = NOW(), decided_by = %s
-                WHERE id = %s
-                """,
-                (new_status, decided_by, request_id),
-            )
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             cur.close()
 
-    if approve:
+    if approvals:
         # Roster changed — invalidate cached roster reads (keyed by week,
         # so a targeted clear isn't possible) so the picks page doesn't
         # keep serving a pre-drop/add roster for up to its 5-minute TTL.
         get_roster_with_context.clear()
 
-        # T19: refresh the local rosters artifact and push the live
-        # WordPress page (Zach, 2026-07-05: auto-push on every approval).
+        # T19: refresh the local rosters artifact once per batch.
         # Imported here (not at module top) to avoid a circular import:
         # html_rosters.py itself uses lib.db's get_connection/roster helpers.
-        # Two separate try/excepts so a WordPress hiccup doesn't skip the
-        # local file (or vice versa) — neither should ever block the
-        # drop/add approval itself from completing.
+        # Never blocks the approval itself, which is already committed.
         try:
             from scripts.html_rosters import write_rosters_page
-            write_rosters_page(req["season_id"])
+            write_rosters_page(approvals[0]["season_id"])
         except Exception as e:
             print(f"[WARNING] Rosters local file refresh failed: {e}")
 

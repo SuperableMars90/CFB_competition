@@ -47,6 +47,7 @@ from lib.db import (
     get_lineup_team_ids,
     get_matchups_for_week,
     get_pick_results_by_player,
+    get_playoff_matchups_for_week,
     get_pod_membership_map,
     get_pod_vs_pod_bonus_by_week,
     get_pods,
@@ -529,7 +530,8 @@ def _matchups_with_live_scores(
     matchup_pairings.winner_id, which stays NULL until finalize_week()
     resolves it.
     """
-    matchups = get_matchups_for_week(season_id, scoring_context_id, week)
+    matchups = (get_matchups_for_week(season_id, scoring_context_id, week)
+                + get_playoff_matchups_for_week(season_id, scoring_context_id, week))
     for m in matchups:
         a_total = player_totals.get(m['player_a_id'], {}).get('total')
         b_total = player_totals.get(m['player_b_id'], {}).get('total')
@@ -848,7 +850,8 @@ def _build_recap_payload(
         scoring_context_id = get_scoring_context(season_id)['id']
     except ValueError:
         scoring_context_id = None
-    matchups = get_matchups_for_week(season_id, scoring_context_id, week) if scoring_context_id else []
+    matchups = (get_matchups_for_week(season_id, scoring_context_id, week)
+                + get_playoff_matchups_for_week(season_id, scoring_context_id, week)) if scoring_context_id else []
 
     scrappy_by_pod = build_scrappy_by_pod(season_id, week, pods)
     overall_results = [{
@@ -1425,7 +1428,7 @@ _STATUS_PAGE_TEMPLATE = """<!-- wp:html -->
       var bPod = byId[m.bId] ? byId[m.bId].podName : null;
       var aTotalTxt = m.aTotal == null ? '&mdash;' : fmtSigned(m.aTotal);
       var bTotalTxt = m.bTotal == null ? '&mdash;' : fmtSigned(m.bTotal);
-      var typeLabel = m.type === 'cross_pod' ? 'Cross-Pod' : 'In-Pod';
+      var typeLabel = { cross_pod: 'Cross-Pod', playoff: 'Playoff', exhibition: 'Exhibition' }[m.type] || 'In-Pod';
       return '<div class="cfb-matchup-card"><span class="cfb-matchup-type">' + typeLabel + '</span>' +
         '<div class="cfb-matchup-sides">' +
         '<div class="cfb-matchup-side ' + (aLead ? 'leading' : 'trailing') + '">' + podChip(aPod) +

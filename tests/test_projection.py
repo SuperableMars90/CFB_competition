@@ -11,6 +11,7 @@ from lib.projection import (
     minutes_remaining,
     parse_clock_minutes,
     projected_margin,
+    slot_projection,
 )
 
 
@@ -216,3 +217,37 @@ def test_live_games_keep_division_and_stable_kickoff_order():
     assert [g["id"] for g in games] == [2, 1]
     assert games[0]["division"] == "fcs"
     assert "_start" not in games[0]
+
+
+# ---- per-slot checkpoint projection ----------------------------------------
+
+def _pick(**kw):
+    base = {"is_pass": False, "team_id": 10, "home_team_id": 10,
+            "cfbd_game_id": 1, "margin": None, "game_status": None}
+    base.update(kw)
+    return base
+
+
+def test_slot_projection_live_game_records_clock_and_projects():
+    # Home team favored by 30 (home_spread -30), up 15 at half -> 30
+    pick = _pick(margin=15, game_status="in_progress")
+    out = slot_projection(pick, {"period": 2, "clock": "0:00"}, {"home_spread": -30})
+    assert out == {"cfbd_game_id": 1, "is_home": True, "period": 2,
+                   "clock": "0:00", "spread": 30, "proj": 30}
+
+
+def test_slot_projection_away_side_flips_spread():
+    pick = _pick(team_id=20, margin=-3, game_status="in_progress")
+    out = slot_projection(pick, {"period": 4, "clock": "15:00"}, {"home_spread": -8})
+    assert out["is_home"] is False and out["spread"] == -8
+    assert out["proj"] == -5
+
+
+def test_slot_projection_final_and_no_line_is_current_margin():
+    assert slot_projection(_pick(margin=7, game_status="final"), None, {"home_spread": -20})["proj"] == 7
+    assert slot_projection(_pick(margin=4, game_status="in_progress"), {"period": 1, "clock": "9:00"}, None)["proj"] == 4
+
+
+def test_slot_projection_pass_is_zero():
+    out = slot_projection({"is_pass": True, "margin": 0}, None, None)
+    assert out["proj"] == 0 and out["cfbd_game_id"] is None and out["is_home"] is None
