@@ -170,22 +170,25 @@ def _classes_desc(group: set[int], metric: dict) -> list[set[int]]:
     return [by_value[v] for v in sorted(by_value, reverse=True)]
 
 
-def resolve_tiebreak_group(
+def resolve_tiebreak_tiers(
     group: set[int],
     all_records: dict[int, list[MatchupRecord]],
     manual_tiebreaks: dict[frozenset, list[int]],
-) -> list[int]:
+) -> list[set[int]]:
     """
-    Returns player_ids from `group` in resolved best-to-worst order.
-    Applies criteria 1 -> 2 -> 3 to the whole group at once; if a
-    criterion splits the group into 2+ classes, recurses independently
-    into each class (generalizing "outright winner + tied rest" and
-    "tied top + clear bottom" to any number of classes of any size).
-    Falls through to a manual_tiebreaks lookup, then raises
-    UnresolvedTieError if still unresolved.
+    Returns `group` split into tiers, best to worst. Applies criteria
+    1 -> 2 -> 3 to the whole group at once; if a criterion splits the
+    group into 2+ classes, recurses independently into each class
+    (generalizing "outright winner + tied rest" and "tied top + clear
+    bottom" to any number of classes of any size). Falls through to a
+    manual_tiebreaks lookup. A group still unresolved after that comes
+    back as a single multi-player tier rather than raising -- callers
+    that need a full order use resolve_tiebreak_group() instead; the
+    what-if scenarios page uses this directly to display such a group as
+    tied.
     """
     if len(group) == 1:
-        return list(group)
+        return [set(group)]
 
     for criterion in (1, 2, 3):
         if criterion == 1:      # record within the tied group
@@ -203,10 +206,10 @@ def resolve_tiebreak_group(
 
         classes = _classes_desc(group, metric)
         if len(classes) > 1:
-            resolved: list[int] = []
+            tiers: list[set[int]] = []
             for cls in classes:
-                resolved.extend(resolve_tiebreak_group(cls, all_records, manual_tiebreaks))
-            return resolved
+                tiers.extend(resolve_tiebreak_tiers(cls, all_records, manual_tiebreaks))
+            return tiers
         # single class -> this criterion didn't separate anyone; fall through
 
     # Criterion 4: manual commissioner override
@@ -217,9 +220,27 @@ def resolve_tiebreak_group(
             raise ValueError(
                 f"stored manual tiebreak for {sorted(key)} doesn't match current group {sorted(group)}"
             )
-        return order
+        return [{pid} for pid in order]
 
-    raise UnresolvedTieError(group)
+    return [set(group)]
+
+
+def resolve_tiebreak_group(
+    group: set[int],
+    all_records: dict[int, list[MatchupRecord]],
+    manual_tiebreaks: dict[frozenset, list[int]],
+) -> list[int]:
+    """
+    Returns player_ids from `group` in resolved best-to-worst order (see
+    resolve_tiebreak_tiers() for the procedure). Raises
+    UnresolvedTieError for the first group criteria 1-4 can't separate.
+    """
+    resolved: list[int] = []
+    for tier in resolve_tiebreak_tiers(group, all_records, manual_tiebreaks):
+        if len(tier) > 1:
+            raise UnresolvedTieError(tier)
+        resolved.extend(tier)
+    return resolved
 
 
 def compute_seeding(

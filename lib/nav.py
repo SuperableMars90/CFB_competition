@@ -29,10 +29,11 @@ SUBMIT_LINEUP = st.Page("app_pages/submit_lineup.py", title="Submit Lineup", ico
 DROP_ADD = st.Page("app_pages/drop_add.py", title="Drop / Add", icon="🔄")
 ROSTERS = st.Page("app_pages/rosters.py", title="Rosters", icon="📋")
 HISTORY = st.Page("app_pages/history.py", title="History", icon="🕘")
+SCENARIOS = st.Page("app_pages/scenarios.py", title="Scenarios", icon="🔮")
 HELP = st.Page("app_pages/help.py", title="Help", icon="❓")
 DRAFT = st.Page("app_pages/draft.py", title="Draft", icon="🏈")
 
-ALL_PAGES = [WELCOME, SUBMIT_LINEUP, DROP_ADD, ROSTERS, HISTORY, HELP, DRAFT]
+ALL_PAGES = [WELCOME, SUBMIT_LINEUP, DROP_ADD, ROSTERS, HISTORY, SCENARIOS, HELP, DRAFT]
 
 
 def visible_pages(player: dict) -> list:
